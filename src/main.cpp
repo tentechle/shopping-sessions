@@ -547,6 +547,19 @@ struct Dict {
   }
 };
 
+// reserve a vector's storage up front, on huge pages when large
+template <class V>
+static void reserve_huge(V& v, size_t n) {
+  if (v.capacity() >= n) return;
+  v.reserve(n);
+  size_t bytes = v.capacity() * sizeof(v[0]);
+  if (bytes >= (4u << 20)) {
+    uintptr_t a = ((uintptr_t)v.data() + 4095) & ~(uintptr_t)4095;
+    uintptr_t e = ((uintptr_t)v.data() + bytes) & ~(uintptr_t)4095;
+    if (e > a) madvise((void*)a, e - a, MADV_HUGEPAGE);
+  }
+}
+
 // ---------------------------------------------------------------- arenas, block lists
 
 struct Arena {
@@ -1750,6 +1763,26 @@ static void worker(int tid) {
     for (int p = 0; p < P; p++) p3order[p] = sz[p].second;
   }
   bar.wait();
+  {
+    // size phase 3 scratch and outputs once: largest partition, rows estimate
+    u64 mx = 0, tot = 0;
+    for (int p = 0; p < P; p++) {
+      u64 s = 0;
+      for (int t = 0; t < T; t++) s += ctx[t].cnt2[p];
+      mx = std::max(mx, s);
+      tot += s;
+    }
+    reserve_huge(c.lid, mx);
+    reserve_huge(c.evs, mx);
+    reserve_huge(c.clv, mx / 2);
+    size_t rows = tot / 7 / (size_t)T + 4096;
+    reserve_huge(c.o_name, rows * 16);
+    reserve_huge(c.o_day, rows);
+    reserve_huge(c.o_sess, rows);
+    reserve_huge(c.o_evn, rows);
+    reserve_huge(c.o_rev, rows);
+    reserve_huge(c.o_top, rows);
+  }
   for (;;) {
     int k = q_p3.fetch_add(1, std::memory_order_relaxed);
     if (k >= P) break;
@@ -1872,7 +1905,8 @@ int main() {
   for (auto& f : list_csv(DATA + "/events")) ev_files.push_back(map_file(f));
   for (auto& f : list_csv(DATA + "/clicks")) cl_files.push_back(map_file(f));
   for (auto& f : list_csv(DATA + "/links")) ln_files.push_back(map_file(f));
-  size_t ev_bytes = 0, cl_bytes = 0;
+  size_t ev_bytes = 0, cl_bytes = 0, ln_bytes = 0;
+  for (auto& f : ln_files) ln_bytes += f.size;
   for (auto& f : ev_files) ev_bytes += f.size;
   for (auto& f : cl_files) cl_bytes += f.size;
   tlog("mapped");
@@ -1917,6 +1951,11 @@ int main() {
     c.arena.init(per_thread * 3);
     c.ev1.init(DP); c.ev2.init(P); c.cl2.init(P);
     c.lend.resize(LP);
+    {
+      size_t lines = ln_bytes / 18 / (size_t)T + 1024;
+      reserve_huge(c.ledges, lines + lines / 2);
+      for (int r = 0; r < LP; r++) reserve_huge(c.lend[r], (2 * lines) / LP * 3 / 2 + 256);
+    }
     c.cnt2.assign(P, 0);
     c.c_sess.assign(cells, 0); c.c_purch.assign(cells, 0); c.c_rev.assign(cells, 0); c.c_assist.assign(cells, 0);
     c.bag.assign(NB, Agg{0, 0, 0, 0, 0});
