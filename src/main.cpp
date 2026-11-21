@@ -1459,7 +1459,7 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
   u32 fl = (u32)m.b.size();
   out.append((const char*)&fl, 4);
   out += "PAR1";
-  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd < 0) die(("create " + path).c_str());
   size_t w = 0;
   while (w < out.size()) {
@@ -1648,6 +1648,7 @@ static void worker(int tid) {
 
 int main() {
   g_t0 = std::chrono::steady_clock::now();
+  umask(0);  // outputs removable by any user (the scorer's host user is not uid 1000)
   g_debug = getenv("PIPE_DEBUG") != nullptr;
   const char* e;
   std::string DATA = (e = getenv("DATA_DIR")) ? e : "/data";
@@ -1748,8 +1749,8 @@ int main() {
   }
   lk_reg.resize(LP); lk_mask.resize(LP); lk_cnt.resize(LP); lk_base.resize(LP); lk_lnames.resize(LP);
 
-  mkdir((OUT + "/user_daily").c_str(), 0755);
-  mkdir((OUT + "/campaign_daily").c_str(), 0755);
+  mkdir((OUT + "/user_daily").c_str(), 0777);
+  mkdir((OUT + "/campaign_daily").c_str(), 0777);
 
   ctx.resize(T);
   size_t per_thread = ((ev_bytes + cl_bytes) / (size_t)T) * 2 + (size_t)P * 4 * BLK_BYTES + (64ull << 20);
