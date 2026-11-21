@@ -1,0 +1,26 @@
+name: check
+on: [push, workflow_dispatch]
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --platform linux/amd64 -t shopping-sessions:latest .
+      - name: Image size
+        run: docker image ls shopping-sessions:latest
+      - name: Test deps
+        run: pip install polars
+      - name: Fixtures in container (scorer flags)
+        run: python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+        env: { CPUS: "4", MEM: "14g" }
+      - name: Build generator
+        run: cd tools/generator && cargo build --release
+      - name: Dev set
+        run: |
+          tools/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          unzip -q tools/dev-answer.zip -d answer
+          mkdir out
+          time CPUS=4 MEM=14g scripts/docker_run.sh dev out
+          ls -la out/user_daily out/campaign_daily
+          cd scripts && python3 compare.py ../out ../answer/dev-answer
