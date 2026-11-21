@@ -99,7 +99,23 @@ __attribute__((always_inline)) static inline H2 hash2(const char* p, size_t n) {
   b = (u64)(m >> 64);
   return H2{wymix(a ^ S0 ^ n, b ^ S1), wymix(a ^ S2, b ^ S3 ^ n)};
 }
-static inline u64 hash1(const char* p, size_t n) { return hash2(p, n).a; }
+// Short ids (<= 16 bytes, all generator ids): first and last 8 bytes plus the
+// length determine the string; one 128-bit multiply mixes them.
+__attribute__((always_inline)) static inline u64 mask_lo(size_t nbytes) {
+  return nbytes >= 8 ? ~0ULL : ((1ULL << (nbytes * 8)) - 1);
+}
+__attribute__((always_inline)) static inline H2 hash2f(const char* p, size_t n) {
+  if (__builtin_expect(n <= 16, 1)) {
+    u64 a = r8(p) & mask_lo(n);
+    u64 b = n > 8 ? r8(p + n - 8) : 0;
+    u64 x = a ^ S0 ^ ((u64)n << 56), y = b ^ S1;
+    __uint128_t m = (__uint128_t)x * y;
+    u64 lo = (u64)m, hi = (u64)(m >> 64);
+    return H2{lo ^ hi, (lo + a) * S2 ^ hi};
+  }
+  return hash2(p, n);
+}
+__attribute__((always_inline)) static inline u64 hash1(const char* p, size_t n) { return hash2f(p, n).a; }
 
 // Length of a value stored by pointer: values never hold , " or \n, and every
 // mapped file is followed by zero padding.
@@ -574,6 +590,7 @@ struct Cl2 {       // clicks, partitioned by person in phase 1
   u64 pkey;
   u64 cref;        // ptr to click_id (48 bits) | campaign (16 bits)
   u64 idkey;       // first 8 bytes of click_id, big-endian, zero padded
+  u64 idt;         // last 8 bytes mixed with the length: equal ids have equal (idkey, idt)
   u32 ts;          // ms since window_start - 7 days
 };
 #pragma pack(pop)
@@ -631,7 +648,7 @@ static inline u64 lk_tag(u64 h) { return (h | (1ULL << 24)) & TAG_MASK; }
 
 struct Endpoint { u64 h; const char* name; };
 
-struct CL { u32 ts; u32 camp; u64 idkey; const char* id; };    // a person's click, local copy
+struct CL { u32 ts; u32 camp; u64 idkey, idt; const char* id; };    // a person's click, local copy
 struct Agg { u32 mn, mx, cnt, sid; u64 rev; };       // one 30-minute bucket of a person
 struct Sess { u32 start; int day; u32 cnt; u32 pad; u64 rev; };
 struct ThreadCtx {
@@ -871,7 +888,7 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     if (!ok) continue;
     size_t en = (size_t)(fe[0] - fs[0]);
     if (!en) continue;
-    H2 h = hash2(fs[0], en);
+    H2 h = hash2f(fs[0], en);
     u64 urefchk = ((u64)(uintptr_t)fs[1] & PTR_MASK) | (h.b << 48);
     i64 ing_s = parse_ingest_s(fs[3], (size_t)(fe[3] - fs[3]));
     i64 ib = (ing_s == BAD_TS ? INT64_MAX / 2000 : ing_s) + ingbias;
@@ -921,7 +938,7 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
   for (int k = 0; k < rn; k++) emit_event(c, ring[(rh + k) & (RING - 1)]);
 }
 
-struct PendC { u64 uh, cref, idkey; u32 ts; };
+struct PendC { u64 uh, cref, idkey, idt; u32 ts; };
 
 static inline void emit_click(ThreadCtx& c, const PendC& e) {
   u64 pk = person_of(e.uh);
@@ -930,6 +947,7 @@ static inline void emit_click(ThreadCtx& c, const PendC& e) {
   r->pkey = pk;
   r->cref = e.cref;
   r->idkey = e.idkey;
+  r->idt = e.idt;
   r->ts = e.ts;
   c.cnt2[pp]++;
 }
@@ -956,7 +974,8 @@ static void parse_clicks(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     lk_prefetch(uh);
     size_t cn = (size_t)(fe[0] - fs[0]);
     u64 idk = __builtin_bswap64(r8(fs[0]) & (cn >= 8 ? ~0ULL : ((1ULL << (cn * 8)) - 1)));
-    PendC e{uh, ((u64)(uintptr_t)fs[0] & PTR_MASK) | ((u64)camp << 48), idk, (u32)(ts - lo)};
+    u64 idt = (cn >= 8 ? r8(fs[0] + cn - 8) : 0) * 0x9E3779B97F4A7C15ULL + cn;
+    PendC e{uh, ((u64)(uintptr_t)fs[0] & PTR_MASK) | ((u64)camp << 48), idk, idt, (u32)(ts - lo)};
     if (rn == RING) {
       emit_click(c, ring[rh]);
       ring[rh] = e;
@@ -1026,7 +1045,7 @@ static void phase2(ThreadCtx& c, int p) {
 // click_id order: compare the 8-byte prefixes, then the strings
 static inline int id_cmp(const CL& x, const CL& y) {
   if (x.idkey != y.idkey) return x.idkey < y.idkey ? -1 : 1;
-  if ((x.idkey & 0xFF) == 0) return 0;  // both ids shorter than 8 bytes and equal
+  if (x.idt == y.idt) return 0;  // same prefix, tail and length: copies of one click
   return vcmp(x.id, y.id);
 }
 static inline bool cl_less(const CL& x, const CL& y) {
@@ -1048,6 +1067,7 @@ static inline void sort_u32(u32* a, u32 n) {
 }
 
 static int NB = 0;        // 30-minute buckets in the window
+static u64 BRUTE_C = 64, BRUTE_K = 8;
 static int NCAT = 0;
 
 static void phase3(ThreadCtx& c, int p) {
@@ -1166,7 +1186,7 @@ static void phase3(ThreadCtx& c, int p) {
         const Cl2* rs = blk_data<Cl2>(b);
         for (u32 k = 0; k < b->n; k++, i++)
           if (c.lid[i] != UINT32_MAX)
-            c.clv[c.ccnt[c.lid[i]]++] = CL{rs[k].ts, (u32)(rs[k].cref >> 48), rs[k].idkey, (const char*)(uintptr_t)(rs[k].cref & PTR_MASK)};
+            c.clv[c.ccnt[c.lid[i]]++] = CL{rs[k].ts, (u32)(rs[k].cref >> 48), rs[k].idkey, rs[k].idt, (const char*)(uintptr_t)(rs[k].cref & PTR_MASK)};
       }
   }
 
@@ -1235,7 +1255,7 @@ static void phase3(ThreadCtx& c, int p) {
         c.c_sess[ci]++;
         if (S[k].rev) { c.c_purch[ci]++; c.c_rev[ci] += (i64)S[k].rev; }
       }
-    } else if ((u64)ns * m <= 64 + 8ULL * (ns + m)) {
+    } else if ((u64)ns * m <= BRUTE_C + BRUTE_K * (u64)(ns + m)) {
       for (u32 k = 0; k < ns; k++) {
         u32 lo = S[k].start;
         u64 hi = (u64)lo + (u64)W7;
@@ -1799,6 +1819,8 @@ int main() {
   DLOG = std::min(14, LOGP + 2);
   if ((e = getenv("PIPE_LOGP"))) LOGP = atoi(e);
   if ((e = getenv("PIPE_DLOG"))) DLOG = atoi(e);
+  if ((e = getenv("PIPE_BC"))) BRUTE_C = atoi(e);
+  if ((e = getenv("PIPE_BK"))) BRUTE_K = atoi(e);
   P = 1 << LOGP;
   DP = 1 << DLOG;
 
