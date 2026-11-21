@@ -32,6 +32,9 @@
 #include <unordered_map>
 #include <vector>
 
+// profile-generate builds get the real one from libgcov; elsewhere it does nothing
+extern "C" __attribute__((weak)) void __gcov_dump(void) {}
+
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef int64_t i64;
@@ -2027,5 +2030,6 @@ int main() {
     fprintf(stderr, "stat: %s\n", st.c_str());
   }
   fflush(stdout);
+  __gcov_dump();  // _exit skips the exit-time profile dump
   _exit(0);
 }

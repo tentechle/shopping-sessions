@@ -8,3 +8,4 @@ pipeline-static
 __pycache__/
 research/
 tools-local/
+build/
