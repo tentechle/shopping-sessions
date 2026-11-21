@@ -276,14 +276,13 @@ static inline const char* parse_line(const char* p, const char* end, const char*
         u64 EQ = _pext_u64(Qlo & Elo, Elo) | (_pext_u64(Qhi & Ehi, Ehi) << _mm_popcnt_u64(Elo));
         fs[0] = p;
         for (int k = 0; k < NF - 1; k++) {
-          // branch-free: take the lowest comma of lo, else of hi
-          u64 tl = _tzcnt_u64(clo), th = _tzcnt_u64(chi);
-          u64 m = (u64)0 - (u64)(clo == 0);  // all ones when lo is used up
-          u64 pos = tl + (m & th);            // tzcnt(0) = 64
+          u32 tl = (u32)_tzcnt_u64(clo), th = (u32)_tzcnt_u64(chi);
+          bool L = clo != 0;
+          u32 pos = L ? tl : 64 + th;
           fe[k] = p + pos;
           fs[k + 1] = p + pos + 1;
           clo = _blsr_u64(clo);
-          chi ^= (chi ^ _blsr_u64(chi)) & m;
+          chi = L ? chi : _blsr_u64(chi);
         }
         fe[NF - 1] = p + nl;
         for (int k = 0; k < NF; k++) {
@@ -1346,18 +1345,19 @@ static void phase3(ThreadCtx& c, int p) {
         u32 stamp = ++c.stamp;
         int best = -1;
         u32 bt = 0;
-        i64* asr = c.c_assist.data() + day;
         for (u32 q = 0; q < m; q++) {
           u32 t = ck[q].ts;
-          bool in = (u64)(t - lo) <= (u64)W7 && t >= lo;
-          u32 cp = ck[q].camp;
-          bool fresh = in & (mark[cp] != stamp);
-          mark[cp] = fresh ? stamp : mark[cp];
-          asr[(size_t)cp * ND] += fresh;
-          bool better = in & ((best < 0) | (t > bt));
-          if (__builtin_expect(in & (best >= 0) & (t == bt), 0)) better = id_cmp(ck[q], ck[best]) < 0;
-          best = better ? (int)q : best;
-          bt = better ? t : bt;
+          if (t >= lo && t <= hi) {
+            u32 cp = ck[q].camp;
+            if (mark[cp] != stamp) {
+              mark[cp] = stamp;
+              c.c_assist[(size_t)cp * ND + day]++;
+            }
+            if (best < 0 || t > bt || (t == bt && id_cmp(ck[q], ck[best]) < 0)) {
+              best = (int)q;
+              bt = t;
+            }
+          }
         }
         int camp = best >= 0 ? (int)ck[best].camp : organic;
         size_t ci = (size_t)camp * ND + day;
