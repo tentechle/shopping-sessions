@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/uio.h>
+#include <malloc.h>
 #include <unistd.h>
 #include <dirent.h>
 
@@ -46,7 +47,8 @@ static const u64 PTR_MASK = (1ULL << 48) - 1;
 static const u32 DEAD = 0xFFFFFFFFu;
 
 static bool g_debug = false;
-static bool g_populate = true;
+static bool g_populate = false;
+static bool g_thp_madvise = true;   // false when THP is already "always"
 static std::chrono::steady_clock::time_point g_t0;
 static void tlog(const char* what) {
   if (!g_debug) return;
@@ -274,13 +276,14 @@ static inline const char* parse_line(const char* p, const char* end, const char*
         u64 EQ = _pext_u64(Qlo & Elo, Elo) | (_pext_u64(Qhi & Ehi, Ehi) << _mm_popcnt_u64(Elo));
         fs[0] = p;
         for (int k = 0; k < NF - 1; k++) {
-          u32 tl = (u32)_tzcnt_u64(clo), th = (u32)_tzcnt_u64(chi);
-          bool L = clo != 0;
-          u32 pos = L ? tl : 64 + th;
+          // branch-free: take the lowest comma of lo, else of hi
+          u64 tl = _tzcnt_u64(clo), th = _tzcnt_u64(chi);
+          u64 m = (u64)0 - (u64)(clo == 0);  // all ones when lo is used up
+          u64 pos = tl + (m & th);            // tzcnt(0) = 64
           fe[k] = p + pos;
           fs[k + 1] = p + pos + 1;
           clo = _blsr_u64(clo);
-          chi = L ? chi : _blsr_u64(chi);
+          chi ^= (chi ^ _blsr_u64(chi)) & m;
         }
         fe[NF - 1] = p + nl;
         for (int k = 0; k < NF; k++) {
@@ -553,7 +556,7 @@ static void reserve_huge(V& v, size_t n) {
   if (v.capacity() >= n) return;
   v.reserve(n);
   size_t bytes = v.capacity() * sizeof(v[0]);
-  if (bytes >= (4u << 20)) {
+  if (g_thp_madvise && bytes >= (4u << 20)) {
     uintptr_t a = ((uintptr_t)v.data() + 4095) & ~(uintptr_t)4095;
     uintptr_t e = ((uintptr_t)v.data() + bytes) & ~(uintptr_t)4095;
     if (e > a) madvise((void*)a, e - a, MADV_HUGEPAGE);
@@ -912,10 +915,21 @@ static void links_finalize_region(int r) {
 }
 
 static inline u64 person_of(u64 uh) {
-  const u64* sl = lk_find_slot(uh);
-  if (sl) return FLAG | (*sl & 0xFFFFFF);
+  u32 r = lreg(uh);
+  const u64* t = lk_reg[r];
+  u64 m = lk_mask[r], tag = lk_tag(uh), s = uh & m;
+  u64 w0 = t[s], w1 = t[(s + 1) & m];
+  bool h0 = (w0 & TAG_MASK) == tag, h1 = (w1 & TAG_MASK) == tag;
   u64 pk = uh & ~FLAG;
-  return pk ? pk : 2;
+  pk = pk ? pk : 2;
+  if (__builtin_expect(h0 | (w0 == 0) | h1 | (w1 == 0), 1)) {
+    // hit in slot 0, else empty slot 0 (miss), else hit in slot 1, else miss
+    u64 linked = FLAG | ((h0 ? w0 : w1) & 0xFFFFFF);
+    bool hit = h0 | ((w0 != 0) & h1);
+    return hit ? linked : pk;
+  }
+  const u64* sl = lk_find_slot(uh);
+  return sl ? (FLAG | (*sl & 0xFFFFFF)) : pk;
 }
 
 struct Pend { u64 uh, eid, uref; u32 ing, ts, pc; };
@@ -1332,19 +1346,18 @@ static void phase3(ThreadCtx& c, int p) {
         u32 stamp = ++c.stamp;
         int best = -1;
         u32 bt = 0;
+        i64* asr = c.c_assist.data() + day;
         for (u32 q = 0; q < m; q++) {
           u32 t = ck[q].ts;
-          if (t >= lo && t <= hi) {
-            u32 cp = ck[q].camp;
-            if (mark[cp] != stamp) {
-              mark[cp] = stamp;
-              c.c_assist[(size_t)cp * ND + day]++;
-            }
-            if (best < 0 || t > bt || (t == bt && id_cmp(ck[q], ck[best]) < 0)) {
-              best = (int)q;
-              bt = t;
-            }
-          }
+          bool in = (u64)(t - lo) <= (u64)W7 && t >= lo;
+          u32 cp = ck[q].camp;
+          bool fresh = in & (mark[cp] != stamp);
+          mark[cp] = fresh ? stamp : mark[cp];
+          asr[(size_t)cp * ND] += fresh;
+          bool better = in & ((best < 0) | (t > bt));
+          if (__builtin_expect(in & (best >= 0) & (t == bt), 0)) better = id_cmp(ck[q], ck[best]) < 0;
+          best = better ? (int)q : best;
+          bt = better ? t : bt;
         }
         int camp = best >= 0 ? (int)ck[best].camp : organic;
         size_t ci = (size_t)camp * ND + day;
@@ -1378,14 +1391,14 @@ static void phase3(ThreadCtx& c, int p) {
           dfirst[d] = (int)k;
         }
       }
-      auto starts_lb = [&](i64 v) {  // first session with start >= v
-        u32 l = 0, r = ns;
-        while (l < r) {
-          u32 mid = (l + r) >> 1;
-          if ((i64)S[mid].start < v) l = mid + 1;
-          else r = mid;
+      auto starts_lb = [&](i64 v) {  // first session with start >= v (branch-free)
+        u32 base = 0, len = ns;
+        while (len > 1) {
+          u32 half = len >> 1;
+          base = ((i64)S[base + half - 1].start < v) ? base + half : base;
+          len -= half;
         }
-        return l;
+        return (len == 1 && (i64)S[base].start < v) ? base + 1 : base;
       };
       u32 q = 0;
       while (q < m) {
@@ -1820,8 +1833,23 @@ static void worker(int tid) {
 int main() {
   g_t0 = std::chrono::steady_clock::now();
   umask(0);  // outputs removable by any user (the scorer's host user is not uid 1000)
+  // One malloc heap that grows in big steps and never shrinks: on the grader's
+  // kernel (6.1) every mmap/mprotect/brk takes mmap_lock for writing and stalls
+  // all threads' page faults, so the run should make almost none of them.
+  {
+    FILE* f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+    char buf[128] = {0};
+    if (f) {
+      if (fgets(buf, sizeof buf, f)) g_thp_madvise = strstr(buf, "[always]") == nullptr;
+      fclose(f);
+    }
+  }
+  mallopt(M_ARENA_MAX, 1);
+  mallopt(M_TOP_PAD, 512 << 20);
+  mallopt(M_TRIM_THRESHOLD, INT32_MAX);
+  mallopt(M_MMAP_THRESHOLD, 32 << 20);
   g_debug = getenv("PIPE_DEBUG") != nullptr;
-  g_populate = getenv("PIPE_NOPOP") == nullptr;
+  g_populate = getenv("PIPE_POPULATE") != nullptr;
   const char* e;
   std::string DATA = (e = getenv("DATA_DIR")) ? e : "/data";
   OUT = (e = getenv("OUTPUT_DIR")) ? e : "/output";
