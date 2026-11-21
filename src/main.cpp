@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -410,7 +411,7 @@ struct Dict {
   std::vector<int32_t> arr;
   std::unordered_map<std::string, int> m;
 
-  static bool split_num(const std::string& k, std::string& pre, u64& num) {
+  static bool split_num(std::string_view k, std::string_view& pre, u64& num) {
     size_t e = k.size(), s = e;
     while (s > 0 && isd(k[s - 1])) s--;
     if (s == e || e - s > 7) return false;
@@ -420,22 +421,25 @@ struct Dict {
     for (size_t i = s; i < e; i++) num = num * 10 + (u64)(k[i] - '0');
     return true;
   }
-  void build(const std::vector<std::pair<std::string, int>>& kv) {
-    for (auto& p : kv) m[p.first] = p.second;
+  void build(const std::vector<std::pair<std::string_view, int>>& kv) {
     fast = !kv.empty();
     u64 mx = 0;
-    for (auto& p : kv) {
-      std::string pre;
+    std::string_view pre0;
+    for (size_t i = 0; i < kv.size() && fast; i++) {
+      std::string_view pre;
       u64 num;
-      if (!split_num(p.first, pre, num)) { fast = false; break; }
-      if (&p == &kv[0]) prefix = pre;
-      else if (pre != prefix) { fast = false; break; }
+      if (!split_num(kv[i].first, pre, num)) fast = false;
+      else if (i == 0) pre0 = pre;
+      else if (pre != pre0) fast = false;
       mx = std::max(mx, num);
     }
-    if (fast) {
+    if (!fast) {
+      for (auto& p : kv) m[std::string(p.first)] = p.second;
+    } else {
+      prefix = std::string(pre0);
       arr.assign(mx + 1, -1);
       for (auto& p : kv) {
-        std::string pre;
+        std::string_view pre;
         u64 num;
         split_num(p.first, pre, num);
         arr[num] = p.second;
@@ -1679,34 +1683,66 @@ int main() {
   ND = (int)((WE - 1) / DAY_MS - day0 + 1);
   NB = (int)((WE - WS) / GAP + 2);
 
-  // products & categories
+  // products & categories, campaigns: rows parsed in place
+  std::string ptxt = read_small(DATA + "/products.csv"), ctxt = read_small(DATA + "/campaigns.csv");
+  auto rows_of = [](std::string& txt) {
+    std::vector<std::pair<std::string_view, std::string_view>> rows;
+    size_t n = txt.size();
+    txt.append(256, '\0');
+    const char* base = txt.data();
+    const char* end = base + n;
+    const char* p = (const char*)memchr(base, '\n', n);
+    if (!p) return rows;
+    p++;
+    const char* fs[8];
+    const char* fe[8];
+    while (p < end) {
+      bool ok;
+      p = parse_line<2>(p, end, fs, fe, ok);
+      if (ok) rows.push_back({std::string_view(fs[0], (size_t)(fe[0] - fs[0])), std::string_view(fs[1], (size_t)(fe[1] - fs[1]))});
+    }
+    return rows;
+  };
   {
-    auto rows = parse_small_csv(read_small(DATA + "/products.csv"), 2);
-    std::vector<std::string> cats;
-    for (auto& r : rows) cats.push_back(r[1]);
-    cats.push_back("unknown");
-    std::sort(cats.begin(), cats.end());
-    cats.erase(std::unique(cats.begin(), cats.end()), cats.end());
-    if (cats.size() > 255) die("too many categories");
-    cat_names = cats;
-    std::unordered_map<std::string, int> crank;
-    for (size_t i = 0; i < cats.size(); i++) crank[cats[i]] = (int)i;
-    cat_unknown = crank["unknown"];
-    NCAT = (int)cats.size();
-    std::vector<std::pair<std::string, int>> kv;
-    for (auto& r : rows) {
-      kv.push_back({r[0], (int)prod_cat.size()});
-      prod_cat.push_back(crank[r[1]]);
+    auto rows = rows_of(ptxt);
+    std::unordered_map<std::string_view, int> seen;
+    std::vector<int> first_id(rows.size());
+    std::vector<std::string_view> order;
+    for (size_t i = 0; i < rows.size(); i++) {
+      auto it = seen.find(rows[i].second);
+      if (it == seen.end()) {
+        it = seen.emplace(rows[i].second, (int)order.size()).first;
+        order.push_back(rows[i].second);
+      }
+      first_id[i] = it->second;
+    }
+    std::vector<std::string> cats(order.begin(), order.end());
+    if (!seen.count("unknown")) cats.push_back("unknown");
+    std::vector<std::string> sorted = cats;
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted.size() > 255) die("too many categories");
+    cat_names = sorted;
+    NCAT = (int)sorted.size();
+    std::vector<int> rank_of(cats.size());
+    for (size_t i = 0; i < cats.size(); i++)
+      rank_of[i] = (int)(std::lower_bound(sorted.begin(), sorted.end(), cats[i]) - sorted.begin());
+    cat_unknown = (int)(std::lower_bound(sorted.begin(), sorted.end(), std::string("unknown")) - sorted.begin());
+    std::vector<std::pair<std::string_view, int>> kv;
+    kv.reserve(rows.size());
+    prod_cat.resize(rows.size());
+    for (size_t i = 0; i < rows.size(); i++) {
+      kv.push_back({rows[i].first, (int)i});
+      prod_cat[i] = rank_of[first_id[i]];
     }
     products.build(kv);
   }
   {
-    auto rows = parse_small_csv(read_small(DATA + "/campaigns.csv"), 2);
-    std::vector<std::pair<std::string, int>> kv;
+    auto rows = rows_of(ctxt);
+    std::vector<std::pair<std::string_view, int>> kv;
     for (auto& r : rows) {
-      kv.push_back({r[0], (int)camp_names.size()});
-      camp_names.push_back(r[0]);
-      camp_channels.push_back(r[1]);
+      kv.push_back({r.first, (int)camp_names.size()});
+      camp_names.emplace_back(r.first);
+      camp_channels.emplace_back(r.second);
     }
     NCAMP = (int)camp_names.size();
     if (NCAMP >= 65535) die("too many campaigns");
