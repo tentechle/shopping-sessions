@@ -51,6 +51,7 @@ static const u32 DEAD = 0xFFFFFFFFu;
 
 static bool g_debug = false;
 static bool g_populate = false;
+static bool g_early_unmap = true;
 static bool g_thp_madvise = true;   // false when THP is already "always"
 static std::chrono::steady_clock::time_point g_t0;
 static void tlog(const char* what) {
@@ -224,7 +225,7 @@ static bool recover_user_key(const std::vector<u64>& mixed, u64 persons_max, u64
 
 // ---------------------------------------------------------------- files
 
-struct MFile { const char* base; size_t size; };
+struct MFile { const char* base; size_t size; char* region; size_t total; };
 
 static MFile map_file(const std::string& path) {
   int fd = open(path.c_str(), O_RDONLY);
@@ -242,7 +243,7 @@ static MFile map_file(const std::string& path) {
     if (r == MAP_FAILED) die("mmap file");
   }
   close(fd);
-  return MFile{region + 4096, sz};
+  return MFile{region + 4096, sz, region, total};
 }
 
 static std::string read_small(const std::string& path) {
@@ -1918,9 +1919,16 @@ static void worker(int tid) {
   bar.wait();
   if (tid == 0) tlog("phase 3 done");
 
+  // Inputs and records are no longer needed (outputs hold copies): release them
+  // now, overlapped with writing, instead of in the single-threaded exit teardown.
+  if (g_early_unmap && tid == (T > 1 ? 1 : 0)) {
+    for (auto* fl : {&ev_files, &cl_files, &ln_files})
+      for (auto& f : *fl) munmap(f.region, f.total);
+  }
   if (tid == 0 || !c.o_day.empty())
     write_user_daily(c, OUT + "/user_daily/part-" + std::to_string(tid) + ".parquet");
   if (tid == T - 1) write_campaign_daily(OUT + "/campaign_daily/part-0.parquet");
+  if (g_early_unmap) munmap(c.arena.base, c.arena.cap);
   if (tid == 0) tlog("written");
 }
 
@@ -1944,6 +1952,7 @@ int main() {
   mallopt(M_MMAP_THRESHOLD, 32 << 20);
   g_debug = getenv("PIPE_DEBUG") != nullptr;
   g_populate = getenv("PIPE_POPULATE") != nullptr;
+  g_early_unmap = getenv("PIPE_NOUNMAP") == nullptr;
   const char* e;
   std::string DATA = (e = getenv("DATA_DIR")) ? e : "/data";
   OUT = (e = getenv("OUTPUT_DIR")) ? e : "/output";
