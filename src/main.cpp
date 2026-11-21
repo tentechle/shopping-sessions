@@ -69,7 +69,7 @@ static const u64 S0 = 0xa0761d6478bd642fULL, S1 = 0xe7037ed1a0b428dbULL,
 
 struct H2 { u64 a, b; };
 
-static inline H2 hash2(const char* p, size_t n) {
+__attribute__((always_inline)) static inline H2 hash2(const char* p, size_t n) {
   u64 seed = S0 ^ n, a, b;
   if (n <= 16) {
     if (n >= 4) {
@@ -331,7 +331,7 @@ static void init_months(int y0, int m0, int count) {
   }
 }
 
-static inline i64 parse_ts(const char* s, size_t n) {
+__attribute__((always_inline)) static inline i64 parse_ts(const char* s, size_t n) {
   if (n >= 5 && s[4] == '-') {
     if (n != 20 && n != 25) return BAD_TS;
     {
@@ -383,6 +383,20 @@ static inline i64 parse_ts(const char* s, size_t n) {
     v = v * 10 + (s[i] - '0');
   }
   return v;
+}
+
+// ingest_ts is always valid F1; returns seconds (BAD_TS if not F1-shaped)
+__attribute__((always_inline)) static inline i64 parse_ingest_s(const char* s, size_t n) {
+  if (__builtin_expect(n == 20 && s[19] == 'Z', 1)) {
+    int y = d2(s) * 100 + d2(s + 2), mo = d2(s + 5), d = d2(s + 8);
+    int mk = y * 12 + mo - 1 - mt_base;
+    if (__builtin_expect((unsigned)mk < (unsigned)mt_n && mo >= 1 && mo <= 12, 1)) {
+      i64 days = mt_first[mk] + d - 1;
+      return days * 86400 + d2(s + 11) * 3600 + d2(s + 14) * 60 + d2(s + 17);
+    }
+  }
+  i64 v = parse_ts(s, n);
+  return v == BAD_TS ? BAD_TS : (v >= 0 ? v / 1000 : -((-v + 999) / 1000));
 }
 
 // digits only, 1..10,000,000; -1 if bad
@@ -848,8 +862,8 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     if (!en) continue;
     H2 h = hash2(fs[0], en);
     u64 urefchk = ((u64)(uintptr_t)fs[1] & PTR_MASK) | (h.b << 48);
-    i64 ing = parse_ts(fs[3], (size_t)(fe[3] - fs[3]));
-    i64 ib = (ing == BAD_TS ? INT64_MAX / 2000 : ing / 1000) + ingbias;
+    i64 ing_s = parse_ingest_s(fs[3], (size_t)(fe[3] - fs[3]));
+    i64 ib = (ing_s == BAD_TS ? INT64_MAX / 2000 : ing_s) + ingbias;
     u32 ingr = ib < 0 ? 0 : (ib > 0xFFFFFFFFLL ? 0xFFFFFFFFu : (u32)ib);
     size_t un = (size_t)(fe[1] - fs[1]);
     bool valid = false;
@@ -857,7 +871,7 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     i64 ts = 0;
     if (un && fe[5] != fs[5]) {
       ts = parse_ts(fs[2], (size_t)(fe[2] - fs[2]));
-      if (ts != BAD_TS && ts >= WS && ts < WE && !(ing != BAD_TS && ing - ts > DAY_MS)) {
+      if (ts != BAD_TS && ts >= WS && ts < WE && !(ing_s != BAD_TS && ing_s * 1000 - ts > DAY_MS)) {
         size_t tn = (size_t)(fe[4] - fs[4]);
         const char* t = fs[4];
         if (tn == 4) {
