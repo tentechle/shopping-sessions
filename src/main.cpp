@@ -181,11 +181,13 @@ static inline i64 id_scrambled(const char* s, size_t n, char prefix) {
 
 // Event key: some sample's index v1 is below n_max; try every v1 and keep the
 // key under which most other samples also decode below n_max.
-static bool recover_event_key(const std::vector<u64>& mixed, u64 n_max, u64& key_out) {
+static bool recover_event_key_range(const std::vector<u64>& mixed, u64 n_max, u64 from, u64 to,
+                                    const std::atomic<bool>* stop, u64& key_out) {
   if (mixed.size() < 8) return false;
   const u64 x1 = mixed[0];
   const size_t need = mixed.size() * 9 / 10;
-  for (u64 v1 = 0; v1 < n_max; v1++) {
+  for (u64 v1 = from; v1 < to; v1++) {
+    if (stop && (v1 & 0xFFFF) == 0 && stop->load(std::memory_order_relaxed)) return false;
     u64 key = (x1 ^ (v1 * SM1)) & M40;
     if ((((mixed[1] ^ key) * SI1) & M40) >= n_max && (((mixed[2] ^ key) * SI1) & M40) >= n_max) continue;
     size_t ok = 0;
@@ -193,6 +195,9 @@ static bool recover_event_key(const std::vector<u64>& mixed, u64 n_max, u64& key
     if (ok >= need) { key_out = key; return true; }
   }
   return false;
+}
+static bool recover_event_key(const std::vector<u64>& mixed, u64 n_max, u64& key_out) {
+  return recover_event_key_range(mixed, n_max, 0, n_max, nullptr, key_out);
 }
 
 // User key: numbers are person * 512 + alias and half the rows use alias 0, so
@@ -849,7 +854,9 @@ struct ThreadCtx {
   Streams<DPRec> dp;
   Streams<ClT> clt, lcl;
   std::vector<u32> pmin, pmax;
-  std::vector<const DPRec*> slot, run;
+  std::vector<const DPRec*> run;
+  std::vector<DPRec> slot;      // index-ordered copies of each event's earliest copy
+  std::vector<u64> occ;         // slot occupancy bitmap
   std::vector<ClT> pcl;
   std::vector<u64> rev;
   std::vector<CL> rcl;
@@ -1695,7 +1702,7 @@ static bool dp_prepare() {
     int k = gnonempty[i];
     if (i > 0) {
       int j = gnonempty[i - 1];
-      if (gpmin[j] >= gpmin[k]) return false;
+      if (gpmin[j] > gpmin[k]) return false;  // equal: a big person spans both (spilled)
       gprevmax[k] = gpmax[j];
     }
     if (i + 1 < gnonempty.size()) gnextmin[k] = gpmin[gnonempty[i + 1]];
@@ -1752,15 +1759,25 @@ static void dp_finish_run(ThreadCtx& c, int k, u32 person, const std::vector<ClT
 
 static void phaseB(ThreadCtx& c, int k) {
   const u32 span = 1u << VSH;
-  if (c.slot.size() < span) c.slot.assign(span, nullptr);
-  const DPRec** sl = c.slot.data();
+  if (c.slot.size() < span) {
+    c.slot.resize(span);
+    c.occ.assign(span / 64, 0);
+  }
+  DPRec* sl = c.slot.data();
+  u64* occ = c.occ.data();
   bool any = false;
   for (int t = 0; t < T; t++)
     for (Blk* b = ctx[t].dp.l[k].head; b; b = b->next) {
       const DPRec* rs = blk_data<DPRec>(b);
       for (u32 i = 0; i < b->n; i++) {
-        const DPRec*& sv = sl[rs[i].vofs];
-        if (!sv || rs[i].ing < sv->ing) sv = rs + i;
+        u32 v = rs[i].vofs;
+        u64 bit = 1ULL << (v & 63);
+        if (!(occ[v >> 6] & bit)) {
+          occ[v >> 6] |= bit;
+          sl[v] = rs[i];
+        } else if (rs[i].ing < sl[v].ing) {
+          sl[v] = rs[i];
+        }
       }
       any |= b->n > 0;
     }
@@ -1773,34 +1790,37 @@ static void phaseB(ThreadCtx& c, int k) {
     }
   std::sort(c.pcl.begin(), c.pcl.end(), [](const ClT& a, const ClT& b) { return a.pkey < b.pkey; });
   u32 cur = PNONE;
-  for (u32 i = 0; i < span; i++) {
-    const DPRec* r = sl[i];
-    if (!r) continue;
-    sl[i] = nullptr;
-    if (r->ts == DEAD) continue;
-    u32 per = r->person;
-    if (dp_local(k, per)) {
-      if (per != cur) {
-        if (!c.run.empty()) dp_finish_run(c, k, cur, c.pcl);
-        cur = per;
+  for (u32 w = 0; w < span / 64; w++) {
+    u64 m = occ[w];
+    if (!m) continue;
+    occ[w] = 0;
+    for (; m; m &= m - 1) {
+      const DPRec* r = sl + (w * 64 + (u32)__builtin_ctzll(m));
+      if (r->ts == DEAD) continue;
+      u32 per = r->person;
+      if (dp_local(k, per)) {
+        if (per != cur) {
+          if (!c.run.empty()) dp_finish_run(c, k, cur, c.pcl);
+          cur = per;
+        }
+        c.run.push_back(r);
+        continue;
       }
-      c.run.push_back(r);
-      continue;
-    }
-    if (per != PNONE) {
-      u32 o = owner[per].load(std::memory_order_relaxed);
-      while (o != OWN_SPILL) {
-        if (o != 0) { g_abort.store(true); break; }
-        if (owner[per].compare_exchange_weak(o, OWN_SPILL)) break;
+      if (per != PNONE) {
+        u32 o = owner[per].load(std::memory_order_relaxed);
+        while (o != OWN_SPILL) {
+          if (o != 0) { g_abort.store(true); break; }
+          if (owner[per].compare_exchange_weak(o, OWN_SPILL)) break;
+        }
       }
+      u32 pp = part_of_pkey(r->pkey);
+      Ev2* o = c.ev2.push(pp, c.arena);
+      o->pkey = r->pkey;
+      o->uref = r->uref;
+      o->ts = r->ts;
+      o->pc = r->pc;
+      c.cnt2[pp]++;
     }
-    u32 pp = part_of_pkey(r->pkey);
-    Ev2* o = c.ev2.push(pp, c.arena);
-    o->pkey = r->pkey;
-    o->uref = r->uref;
-    o->ts = r->ts;
-    o->pc = r->pc;
-    c.cnt2[pp]++;
   }
   if (!c.run.empty()) dp_finish_run(c, k, cur, c.pcl);
 }
@@ -2364,7 +2384,9 @@ int main(int, char** argv) {
   DP = 1 << DLOG;
 
   // direct placement: recover the generator's id keys from a sample of events
-  if (!getenv("PIPE_GENERIC")) {
+  // Measured slower than the general path on 20M events (decoding and the
+  // index-ordered sweep cost more than they save), so it is opt-in.
+  if (getenv("PIPE_DP") && !getenv("PIPE_GENERIC")) {
     std::vector<u64> em, um;
     for (auto& f : ev_files) {
       const char* p = chunk_start(f, 0);
@@ -2384,7 +2406,26 @@ int main(int, char** argv) {
       if (em.size() >= 64 && um.size() >= 256) break;
     }
     u64 ncap = ev_bytes / 50 + 1024, pmax = ncap / 8 + 1024;
-    if (em.size() >= 64 && um.size() >= 256 && recover_event_key(em, ncap, EVKEY) && recover_user_key(um, pmax, USKEY)) {
+    bool ek = false;
+    if (em.size() >= 64 && um.size() >= 256) {
+      std::atomic<bool> found{false};
+      std::vector<std::thread> ths;
+      std::vector<u64> keys(T, 0);
+      u64 step = ncap / (u64)T + 1;
+      for (int t = 0; t < T; t++)
+        ths.emplace_back([&, t]() {
+          if (recover_event_key_range(em, ncap, step * t, std::min(ncap, step * (t + 1)), &found, keys[t])) found.store(true);
+        });
+      for (auto& x : ths) x.join();
+      for (int t = 0; t < T && !ek; t++)
+        if (keys[t] || found.load()) {
+          // confirm: the key a thread reported must decode the samples
+          size_t ok = 0;
+          for (u64 x : em) ok += (((x ^ keys[t]) * SI1) & M40) < ncap;
+          if (ok >= em.size() * 9 / 10) { EVKEY = keys[t]; ek = true; }
+        }
+    }
+    if (ek && recover_user_key(um, pmax, USKEY)) {
       g_dp = true;
       NCAP = ncap;
       PMAX = (u32)std::min<u64>(pmax, 0xFFFFFFF0u);
