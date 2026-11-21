@@ -884,7 +884,8 @@ struct ThreadCtx {
   // outputs
   std::string o_name;        // PLAIN byte arrays
   std::vector<int32_t> o_day;
-  std::vector<i64> o_sess, o_evn, o_rev;
+  std::vector<int32_t> o_sess, o_evn;  // per person-day: always fit in 32 bits
+  std::vector<i64> o_rev;
   std::vector<int16_t> o_top;
   std::vector<i64> c_sess, c_purch, c_rev, c_assist;   // (NCAMP+1) x ND
   std::vector<u64> dtab;
@@ -1528,8 +1529,8 @@ static void process_person(ThreadCtx& c, const u64* ev, u32 n, CL* ck, u32 m, co
     c.o_name.append((const char*)&namelen, 4);
     c.o_name.append(name, namelen);
     c.o_day.push_back((int32_t)(day0 + day));
-    c.o_sess.push_back(dsess);
-    c.o_evn.push_back(devn);
+    c.o_sess.push_back((int32_t)dsess);
+    c.o_evn.push_back((int32_t)devn);
     c.o_rev.push_back(drev);
     c.o_top.push_back((int16_t)top);
   }
@@ -1994,6 +1995,14 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
 
 static void write_user_daily(ThreadCtx& c, const std::string& path) {
   size_t n = c.o_day.size();
+  // revenue as INT32 when every value fits (any integer width is accepted)
+  bool rev32 = true;
+  for (size_t r = 0; r < n && rev32; r++) rev32 = c.o_rev[r] <= INT32_MAX;
+  std::vector<int32_t> rv32;
+  if (rev32) {
+    rv32.resize(n);
+    for (size_t r = 0; r < n; r++) rv32[r] = (int32_t)c.o_rev[r];
+  }
   std::string tops;
   for (size_t r = 0; r < n; r++) {
     int t = c.o_top[r];
@@ -2006,9 +2015,10 @@ static void write_user_daily(ThreadCtx& c, const std::string& path) {
   std::vector<PCol> cols = {
       {"user_id", PT_BYTES, false, 1, c.o_name.data(), c.o_name.size(), nullptr, n},
       {"day", PT_INT32, false, 6, (const char*)c.o_day.data(), n * 4, nullptr, n},
-      {"sessions", PT_INT64, false, 0, (const char*)c.o_sess.data(), n * 8, nullptr, n},
-      {"events", PT_INT64, false, 0, (const char*)c.o_evn.data(), n * 8, nullptr, n},
-      {"revenue_cents", PT_INT64, false, 0, (const char*)c.o_rev.data(), n * 8, nullptr, n},
+      {"sessions", PT_INT32, false, 0, (const char*)c.o_sess.data(), n * 4, nullptr, n},
+      {"events", PT_INT32, false, 0, (const char*)c.o_evn.data(), n * 4, nullptr, n},
+      rev32 ? PCol{"revenue_cents", PT_INT32, false, 0, (const char*)rv32.data(), n * 4, nullptr, n}
+            : PCol{"revenue_cents", PT_INT64, false, 0, (const char*)c.o_rev.data(), n * 8, nullptr, n},
       {"top_category", PT_BYTES, true, 1, tops.data(), tops.size(), &c.o_top, n},
   };
   write_parquet(path, cols, n);
