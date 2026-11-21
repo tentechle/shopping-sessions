@@ -212,17 +212,11 @@ static inline void strip(const char*& s, const char*& e, int& q) {
   }
 }
 
-static inline void strip_bl(const char*& s, const char*& e, int& q) {
-  long n = e - s;
-  int t = (n >= 2) & (s[0] == '"') & (e[-1] == '"');
-  s += t;
-  e -= t;
-  q += t;
-}
-
 // Parses a line that must have NF fields. Fast path looks at 128 bytes from
-// the line start; longer lines and EOF take split_line. ok is false when the
-// line is malformed. Returns the start of the next line.
+// the line start and checks the quoting rule with bitmasks alone: a field is
+// quoted when the quote mask has a bit at both its first and last character,
+// and every quote must be one of those. Longer lines and EOF take split_line.
+// ok is false when the line is malformed. Returns the start of the next line.
 template <int NF>
 static inline const char* parse_line(const char* p, const char* end, const char** fs, const char** fe, bool& ok) {
   if (__builtin_expect(end - p >= 128, 1)) {
@@ -230,34 +224,50 @@ static inline const char* parse_line(const char* p, const char* end, const char*
     __m256i v0 = _mm256_loadu_si256((const __m256i*)p), v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
     __m256i v2 = _mm256_loadu_si256((const __m256i*)(p + 64)), v3 = _mm256_loadu_si256((const __m256i*)(p + 96));
 #define MM(x, k) ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, k)))
-    u64 nlo = MM(v0, N) | (MM(v1, N) << 32);
-    u64 nhi = MM(v2, N) | (MM(v3, N) << 32);
+    u64 nlo = MM(v0, N) | (MM(v1, N) << 32), nhi = MM(v2, N) | (MM(v3, N) << 32);
     if (__builtin_expect((nlo | nhi) != 0, 1)) {
       u64 clo = MM(v0, C) | (MM(v1, C) << 32), chi = MM(v2, C) | (MM(v3, C) << 32);
       u64 qlo = MM(v0, Q) | (MM(v1, Q) << 32), qhi = MM(v2, Q) | (MM(v3, Q) << 32);
 #undef MM
       u32 nl = nlo ? (u32)_tzcnt_u64(nlo) : 64 + (u32)_tzcnt_u64(nhi);
-      u64 klo = _bzhi_u64(~0ULL, nl);
-      u64 khi = nl >= 64 ? _bzhi_u64(~0ULL, nl - 64) : 0;
-      clo &= klo;
-      chi &= khi;
-      int quotes = (int)(_mm_popcnt_u64(qlo & klo) + _mm_popcnt_u64(qhi & khi));
-      bool good = (_mm_popcnt_u64(clo) + _mm_popcnt_u64(chi)) == NF - 1;
-      fs[0] = p;
-      for (int k = 0; k < NF - 1; k++) {
-        u32 tl = (u32)_tzcnt_u64(clo), th = (u32)_tzcnt_u64(chi);
-        bool L = clo != 0;
-        u32 pos = L ? tl : 64 + th;
-        fe[k] = p + pos;
-        fs[k + 1] = p + pos + 1;
-        clo = _blsr_u64(clo);
-        chi = L ? chi : _blsr_u64(chi);
+      if (__builtin_expect(nl <= 126, 1)) {
+        u64 klo = _bzhi_u64(~0ULL, nl), khi = nl >= 64 ? _bzhi_u64(~0ULL, nl - 64) : 0;
+        clo &= klo;
+        chi &= khi;
+        qlo &= klo;
+        qhi &= khi;
+        bool good = (_mm_popcnt_u64(clo) + _mm_popcnt_u64(chi)) == NF - 1;
+        // shifted coordinates: bit x+1 is line position x, so bit 0 is position -1.
+        // field starts: positions 0 and c+1; field ends (last char): c-1 and nl-1
+        u64 Slo = (clo << 2) | 2, Shi = (chi << 2) | (clo >> 62);
+        u64 Elo = clo, Ehi = chi;
+        if (nl < 64) Elo |= 1ULL << nl;
+        else Ehi |= 1ULL << (nl - 64);
+        u64 Qlo = qlo << 1, Qhi = (qhi << 1) | (qlo >> 63);
+        // stray quotes, and one-character fields that are a lone quote
+        u64 bad = (Qlo & ~(Slo | Elo)) | (Qhi & ~(Shi | Ehi)) | (Qlo & Slo & Elo) | (Qhi & Shi & Ehi);
+        // per-field bits: quoted at start / quoted at end
+        u64 SQ = _pext_u64(Qlo & Slo, Slo) | (_pext_u64(Qhi & Shi, Shi) << _mm_popcnt_u64(Slo));
+        u64 EQ = _pext_u64(Qlo & Elo, Elo) | (_pext_u64(Qhi & Ehi, Ehi) << _mm_popcnt_u64(Elo));
+        fs[0] = p;
+        for (int k = 0; k < NF - 1; k++) {
+          u32 tl = (u32)_tzcnt_u64(clo), th = (u32)_tzcnt_u64(chi);
+          bool L = clo != 0;
+          u32 pos = L ? tl : 64 + th;
+          fe[k] = p + pos;
+          fs[k + 1] = p + pos + 1;
+          clo = _blsr_u64(clo);
+          chi = L ? chi : _blsr_u64(chi);
+        }
+        fe[NF - 1] = p + nl;
+        for (int k = 0; k < NF; k++) {
+          u64 t = (SQ >> k) & 1;
+          fs[k] += t;
+          fe[k] -= t;
+        }
+        ok = good & (bad == 0) & (SQ == EQ);
+        return p + nl + 1;
       }
-      fe[NF - 1] = p + nl;
-      int qq = 0;
-      for (int k = 0; k < NF; k++) strip_bl(fs[k], fe[k], qq);
-      ok = good & (qq * 2 == quotes);
-      return p + nl + 1;
     }
   }
   int nf, q;
@@ -561,9 +571,10 @@ struct Ev2 {       // valid event copy, partitioned by person; ts = DEAD once de
   u32 pc;
 };
 struct Cl2 {       // clicks, partitioned by person in phase 1
-  u64 pkey;        // ts: ms since window_start - 7 days
-  u64 cref;
-  u32 ts;
+  u64 pkey;
+  u64 cref;        // ptr to click_id (48 bits) | campaign (16 bits)
+  u64 idkey;       // first 8 bytes of click_id, big-endian, zero padded
+  u32 ts;          // ms since window_start - 7 days
 };
 #pragma pack(pop)
 
@@ -620,7 +631,7 @@ static inline u64 lk_tag(u64 h) { return (h | (1ULL << 24)) & TAG_MASK; }
 
 struct Endpoint { u64 h; const char* name; };
 
-struct CL { u32 ts; u32 camp; const char* id; };    // a person's click, local copy
+struct CL { u32 ts; u32 camp; u64 idkey; const char* id; };    // a person's click, local copy
 struct Agg { u32 mn, mx, cnt, sid; u64 rev; };       // one 30-minute bucket of a person
 struct Sess { u32 start; int day; u32 cnt; u32 pad; u64 rev; };
 struct ThreadCtx {
@@ -910,7 +921,7 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
   for (int k = 0; k < rn; k++) emit_event(c, ring[(rh + k) & (RING - 1)]);
 }
 
-struct PendC { u64 uh, cref; u32 ts; };
+struct PendC { u64 uh, cref, idkey; u32 ts; };
 
 static inline void emit_click(ThreadCtx& c, const PendC& e) {
   u64 pk = person_of(e.uh);
@@ -918,6 +929,7 @@ static inline void emit_click(ThreadCtx& c, const PendC& e) {
   Cl2* r = c.cl2.push(pp, c.arena);
   r->pkey = pk;
   r->cref = e.cref;
+  r->idkey = e.idkey;
   r->ts = e.ts;
   c.cnt2[pp]++;
 }
@@ -942,7 +954,9 @@ static void parse_clicks(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     if (ts == BAD_TS || ts < lo || ts >= WE) continue;
     u64 uh = hash1(fs[1], (size_t)(fe[1] - fs[1]));
     lk_prefetch(uh);
-    PendC e{uh, ((u64)(uintptr_t)fs[0] & PTR_MASK) | ((u64)camp << 48), (u32)(ts - lo)};
+    size_t cn = (size_t)(fe[0] - fs[0]);
+    u64 idk = __builtin_bswap64(r8(fs[0]) & (cn >= 8 ? ~0ULL : ((1ULL << (cn * 8)) - 1)));
+    PendC e{uh, ((u64)(uintptr_t)fs[0] & PTR_MASK) | ((u64)camp << 48), idk, (u32)(ts - lo)};
     if (rn == RING) {
       emit_click(c, ring[rh]);
       ring[rh] = e;
@@ -1009,10 +1023,16 @@ static void phase2(ThreadCtx& c, int p) {
 // ---------------------------------------------------------------- phase 3
 
 
+// click_id order: compare the 8-byte prefixes, then the strings
+static inline int id_cmp(const CL& x, const CL& y) {
+  if (x.idkey != y.idkey) return x.idkey < y.idkey ? -1 : 1;
+  if ((x.idkey & 0xFF) == 0) return 0;  // both ids shorter than 8 bytes and equal
+  return vcmp(x.id, y.id);
+}
 static inline bool cl_less(const CL& x, const CL& y) {
   if (x.ts != y.ts) return x.ts < y.ts;
   // equal ts: larger click_id first, so the last qualifying click has the smallest id
-  return vcmp(x.id, y.id) > 0;
+  return id_cmp(x, y) > 0;
 }
 
 static inline void sort_u32(u32* a, u32 n) {
@@ -1146,7 +1166,7 @@ static void phase3(ThreadCtx& c, int p) {
         const Cl2* rs = blk_data<Cl2>(b);
         for (u32 k = 0; k < b->n; k++, i++)
           if (c.lid[i] != UINT32_MAX)
-            c.clv[c.ccnt[c.lid[i]]++] = CL{rs[k].ts, (u32)(rs[k].cref >> 48), (const char*)(uintptr_t)(rs[k].cref & PTR_MASK)};
+            c.clv[c.ccnt[c.lid[i]]++] = CL{rs[k].ts, (u32)(rs[k].cref >> 48), rs[k].idkey, (const char*)(uintptr_t)(rs[k].cref & PTR_MASK)};
       }
   }
 
@@ -1231,7 +1251,7 @@ static void phase3(ThreadCtx& c, int p) {
               mark[cp] = stamp;
               c.c_assist[(size_t)cp * ND + day]++;
             }
-            if (best < 0 || t > bt || (t == bt && vcmp(ck[q].id, ck[best].id) < 0)) {
+            if (best < 0 || t > bt || (t == bt && id_cmp(ck[q], ck[best]) < 0)) {
               best = (int)q;
               bt = t;
             }
@@ -1245,7 +1265,7 @@ static void phase3(ThreadCtx& c, int p) {
     } else {
       // many sessions and clicks: credit by two pointers over sorted clicks,
       // assists by merging each campaign's click intervals [t - 7d, t]
-      std::sort(ck, ck + m, cl_less);
+      std::sort(ck, ck + m, [](const CL& x, const CL& y) { return cl_less(x, y); });
       u32 hi = 0;
       for (u32 k = 0; k < ns; k++) {
         u32 s0 = S[k].start;
@@ -1776,7 +1796,7 @@ int main() {
   LOGP = 4;
   while (LOGP < 12 && (est_events >> LOGP) > 24000) LOGP++;
   LOGP = std::max(4, LOGP - 2);
-  DLOG = LOGP;
+  DLOG = std::min(14, LOGP + 2);
   if ((e = getenv("PIPE_LOGP"))) LOGP = atoi(e);
   if ((e = getenv("PIPE_DLOG"))) DLOG = atoi(e);
   P = 1 << LOGP;
