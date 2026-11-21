@@ -181,13 +181,11 @@ static inline i64 id_scrambled(const char* s, size_t n, char prefix) {
 
 // Event key: some sample's index v1 is below n_max; try every v1 and keep the
 // key under which most other samples also decode below n_max.
-static bool recover_event_key_range(const std::vector<u64>& mixed, u64 n_max, u64 from, u64 to,
-                                    const std::atomic<bool>* stop, u64& key_out) {
+static bool recover_event_key(const std::vector<u64>& mixed, u64 n_max, u64& key_out) {
   if (mixed.size() < 8) return false;
   const u64 x1 = mixed[0];
   const size_t need = mixed.size() * 9 / 10;
-  for (u64 v1 = from; v1 < to; v1++) {
-    if (stop && (v1 & 0xFFFF) == 0 && stop->load(std::memory_order_relaxed)) return false;
+  for (u64 v1 = 0; v1 < n_max; v1++) {
     u64 key = (x1 ^ (v1 * SM1)) & M40;
     if ((((mixed[1] ^ key) * SI1) & M40) >= n_max && (((mixed[2] ^ key) * SI1) & M40) >= n_max) continue;
     size_t ok = 0;
@@ -195,9 +193,6 @@ static bool recover_event_key_range(const std::vector<u64>& mixed, u64 n_max, u6
     if (ok >= need) { key_out = key; return true; }
   }
   return false;
-}
-static bool recover_event_key(const std::vector<u64>& mixed, u64 n_max, u64& key_out) {
-  return recover_event_key_range(mixed, n_max, 0, n_max, nullptr, key_out);
 }
 
 // User key: numbers are person * 512 + alias and half the rows use alias 0, so
@@ -731,20 +726,6 @@ struct Ev2 {       // valid event copy, partitioned by person; ts = DEAD once de
   u32 ts;
   u32 pc;
 };
-struct DPRec {     // event copy with a decoded event index, partitioned by index range
-  u64 pkey;
-  u64 uref;
-  u32 vofs;        // index within the partition
-  u32 ing;
-  u32 ts;          // DEAD if the copy is invalid
-  u32 pc;
-  u32 person;      // generator person of a single-person component, else PNONE
-  u32 pad;
-};
-struct ClT {       // click before routing (direct placement)
-  u64 pkey, cref, idkey, idt;
-  u32 ts, person;
-};
 struct Cl2 {       // clicks, partitioned by person in phase 1
   u64 pkey;
   u64 cref;        // ptr to click_id (48 bits) | campaign (16 bits)
@@ -757,30 +738,6 @@ struct Cl2 {       // clicks, partitioned by person in phase 1
 // ---------------------------------------------------------------- globals
 
 static int T = 8;
-// direct placement: see the "phase B" section
-static bool g_dp = false;
-static u64 EVKEY = 0, USKEY = 0, NCAP = 0;
-static int VSH = 17, VP = 0;
-static u32 PMAX = 0;
-static const u32 PNONE = 0xFFFFFFFFu, OWN_SPILL = 0xFFFFFFFEu;
-static std::atomic<u32>* owner = nullptr;  // per person: 0, 1 + local partition, OWN_SPILL
-static std::atomic<bool> g_abort{false};
-static u8* taint = nullptr;  // per person: has an event on the general path
-static std::vector<u32> gpmin, gpmax;       // per index partition: persons seen
-static std::vector<u32> lk_cperson;         // linked id -> its component's single person or PNONE
-
-static const u32 NODP = 0xFFFFFFFDu;  // Pend.up: event takes the general path
-
-// generator person of a user id string, or PNONE
-static inline u32 user_person(const char* s, size_t n) {
-  i64 sc = id_scrambled(s, n, 'u');
-  if (sc < 0) return PNONE;
-  u64 num = unscramble((u64)sc, USKEY);
-  if (num >= (1ULL << 39)) return PNONE;  // kiosk ids
-  u64 p = num >> 9;
-  return p < PMAX ? (u32)p : PNONE;
-}
-static inline u32 comp_person(u64 pk, u32 up) { return (pk & FLAG) ? lk_cperson[(u32)pk] : up; }
 static int LOGP = 6, P = 64;      // person partitions
 static int DLOG = 6, DP = 64;     // dedup partitions
 static i64 WS, WE;       // window ms
@@ -836,8 +793,6 @@ struct LkMem {
 };
 static LkMem lk_mem;
 static std::atomic<u32>* uf_best = nullptr;
-static std::atomic<u32>* uf_cp = nullptr;   // per root: single generator person, PNONE, or CP_UNSET
-static const u32 CP_UNSET = 0xFFFFFFFCu;
 static u32 lk_total = 0;
 static const u64 TAG_MASK = ~0xFFFFFFULL;
 static inline u64 lk_tag(u64 h) { return (h | (1ULL << 24)) & TAG_MASK; }
@@ -851,15 +806,6 @@ struct ThreadCtx {
   std::vector<std::vector<Endpoint>> lend;   // per link region
   std::vector<std::pair<u64, u64>> ledges;
   Streams<DRec> ev1;
-  Streams<DPRec> dp;
-  Streams<ClT> clt, lcl;
-  std::vector<u32> pmin, pmax;
-  std::vector<const DPRec*> run;
-  std::vector<DPRec> slot;      // index-ordered copies of each event's earliest copy
-  std::vector<u64> occ;         // slot occupancy bitmap
-  std::vector<ClT> pcl;
-  std::vector<u64> rev;
-  std::vector<CL> rcl;
   Streams<Ev2> ev2;
   Streams<Cl2> cl2;
   std::vector<u32> cnt2;     // ev2 + cl2 records per partition
@@ -894,15 +840,11 @@ static std::vector<ThreadCtx> ctx;
 
 // ---------------------------------------------------------------- barrier
 
-static thread_local int bar_tid = 0;
-static u64 bar_idle[64];
 struct Barrier {
   std::atomic<int> count{0};
   std::atomic<int> gen{0};
   int n = 0;
   void wait() {
-    u64 t0 = g_debug ? __rdtsc() : 0;
-    struct Guard { u64 t0; ~Guard() { if (t0) bar_idle[bar_tid] += __rdtsc() - t0; } } guard{t0};
     int g = gen.load(std::memory_order_acquire);
     if (count.fetch_add(1, std::memory_order_acq_rel) == n - 1) {
       count.store(0, std::memory_order_relaxed);
@@ -1038,14 +980,6 @@ static void links_union(ThreadCtx& c) {
 static void links_best(u32 lo, u32 hi) {
   for (u32 i = lo; i < hi; i++) {
     u32 r = uf_find(i);
-    if (g_dp) {
-      u32 pp = user_person(lk_names[i], lk_nlen[i]);
-      u32 cur = uf_cp[r].load(std::memory_order_relaxed);
-      for (;;) {
-        u32 want = cur == CP_UNSET ? pp : (cur == pp ? cur : PNONE);
-        if (want == cur || uf_cp[r].compare_exchange_weak(cur, want)) break;
-      }
-    }
     u32 cur = uf_best[r].load(std::memory_order_relaxed);
     for (;;) {
       if (cur != UINT32_MAX && name_cmp(i, cur) >= 0) break;
@@ -1081,35 +1015,15 @@ static inline u64 person_of(u64 uh) {
   return sl ? (FLAG | (*sl & 0xFFFFFF)) : pk;
 }
 
-struct Pend { u64 uh, eid, uref; u32 ing, ts, pc, up; bool dp; };  // eid holds v when dp
-
-
+struct Pend { u64 uh, eid, uref; u32 ing, ts, pc; };
 static const int RING = 16;
 
 static inline void emit_event(ThreadCtx& c, const Pend& e) {
+#ifdef EXP_NOPERSON
+  u64 pk = e.uh;
+#else
   u64 pk = person_of(e.uh);
-  if (e.dp) {
-    u32 k = (u32)(e.eid >> VSH);
-    DPRec* d = c.dp.push(k, c.arena);
-    u32 per = comp_person(pk, e.up);
-    d->pkey = pk;
-    d->uref = e.uref & PTR_MASK;
-    d->vofs = (u32)(e.eid & ((1u << VSH) - 1));
-    d->ing = e.ing;
-    d->ts = e.ts;
-    d->pc = e.pc;
-    d->person = per;
-    if (per != PNONE) {
-      c.pmin[k] = std::min(c.pmin[k], per);
-      c.pmax[k] = std::max(c.pmax[k], per);
-    }
-    return;
-  }
-  if (g_dp) {
-    // this person has an event on the general path: finish the whole person there
-    u32 per = comp_person(pk, e.up);
-    if (per != PNONE) taint[per] = 1;
-  }
+#endif
 
   u32 pp = part_of_pkey(pk);
   Ev2* o = c.ev2.push(pp, c.arena);
@@ -1140,16 +1054,7 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     if (!ok) continue;
     size_t en = (size_t)(fe[0] - fs[0]);
     if (!en) continue;
-    u64 v = 0;
-    bool dp = false;
-    if (g_dp) {
-      i64 es = id_scrambled(fs[0], en, 'e');
-      if (es >= 0) {
-        v = unscramble((u64)es, EVKEY);
-        dp = v < NCAP;
-      }
-    }
-    H2 h = dp ? H2{v, 0} : hash2f(fs[0], en);
+    H2 h = hash2f(fs[0], en);
     u64 urefchk = ((u64)(uintptr_t)fs[1] & PTR_MASK) | (h.b << 48);
     i64 ing_s = parse_ingest_s(fs[3], (size_t)(fe[3] - fs[3]));
     i64 ib = (ing_s == BAD_TS ? INT64_MAX / 2000 : ing_s) + ingbias;
@@ -1177,17 +1082,6 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
         }
       }
     }
-    if (!valid && dp) {
-      DPRec* d = c.dp.push((u32)(v >> VSH), c.arena);
-      d->pkey = 0;
-      d->uref = 0;
-      d->vofs = (u32)(v & ((1u << VSH) - 1));
-      d->ing = ingr;
-      d->ts = DEAD;
-      d->pc = 0;
-      d->person = PNONE;
-      continue;
-    }
     if (!valid) {
       DRec* d = c.ev1.push(part_of(h.a), c.arena);
       d->eid = h.a;
@@ -1197,7 +1091,7 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     }
     u64 uh = hash1(fs[1], un);
     lk_prefetch(uh);
-    Pend e{uh, h.a, urefchk, ingr, (u32)(ts - WS), pc, g_dp ? user_person(fs[1], un) : PNONE, dp};
+    Pend e{uh, h.a, urefchk, ingr, (u32)(ts - WS), pc};
     if (rn == RING) {
       emit_event(c, ring[rh]);
       ring[rh] = e;
@@ -1210,20 +1104,10 @@ static void parse_events(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
   for (int k = 0; k < rn; k++) emit_event(c, ring[(rh + k) & (RING - 1)]);
 }
 
-struct PendC { u64 uh, cref, idkey, idt; u32 ts, up; };
+struct PendC { u64 uh, cref, idkey, idt; u32 ts; };
 
 static inline void emit_click(ThreadCtx& c, const PendC& e) {
   u64 pk = person_of(e.uh);
-  if (g_dp) {  // routed after phase 1, once each partition's persons are known
-    ClT* r = c.clt.push(0, c.arena);
-    r->pkey = pk;
-    r->cref = e.cref;
-    r->idkey = e.idkey;
-    r->idt = e.idt;
-    r->ts = e.ts;
-    r->person = comp_person(pk, e.up);
-    return;
-  }
   u32 pp = part_of_pkey(pk);
   Cl2* r = c.cl2.push(pp, c.arena);
   r->pkey = pk;
@@ -1257,8 +1141,7 @@ static void parse_clicks(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     size_t cn = (size_t)(fe[0] - fs[0]);
     u64 idk = __builtin_bswap64(r8(fs[0]) & (cn >= 8 ? ~0ULL : ((1ULL << (cn * 8)) - 1)));
     u64 idt = (cn >= 8 ? r8(fs[0] + cn - 8) : 0) * 0x9E3779B97F4A7C15ULL + cn;
-    PendC e{uh, ((u64)(uintptr_t)fs[0] & PTR_MASK) | ((u64)camp << 48), idk, idt, (u32)(ts - lo),
-            g_dp ? user_person(fs[1], (size_t)(fe[1] - fs[1])) : PNONE};
+    PendC e{uh, ((u64)(uintptr_t)fs[0] & PTR_MASK) | ((u64)camp << 48), idk, idt, (u32)(ts - lo)};
     if (rn == RING) {
       emit_click(c, ring[rh]);
       ring[rh] = e;
@@ -1661,175 +1544,6 @@ static void phase3(ThreadCtx& c, int p) {
                    c.coff[pi + 1] - c.coff[pi], (const char*)(uintptr_t)c.pname[pi]);
 }
 
-// ---------------------------------------------------------------- phase B (direct placement)
-//
-// The generator numbers events person by person, so an index range is a range
-// of people. Per index partition: keep each event's earliest copy in a slot
-// array, then sweep the slots in order. A person strictly inside the
-// partition's person range (and outside its neighbours' ranges) is finished
-// here; everyone else goes to the general path. owner[] checks that no person
-// is finished in two places or both finished and spilled; any conflict means
-// the data is not shaped as assumed, and the run restarts in general mode.
-
-static std::vector<i64> gprevmax, gnextmin;  // neighbouring non-empty partitions' bounds
-static std::vector<int> gnonempty;           // non-empty partitions in order
-
-static inline bool dp_local(int k, u32 p) {
-  return p != PNONE && p > gpmin[k] && p < gpmax[k] && (i64)p > gprevmax[k] && (i64)p < gnextmin[k] && !taint[p];
-}
-
-// partition whose range may hold person p (largest non-empty k with gpmin[k] < p), or -1
-static inline int dp_find(u32 p) {
-  int lo = 0, hi = (int)gnonempty.size();
-  while (lo < hi) {
-    int mid = (lo + hi) >> 1;
-    if (gpmin[gnonempty[mid]] < p) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo == 0 ? -1 : gnonempty[lo - 1];
-}
-
-// thread 0, after phase 1: merge per-thread ranges; false if the ranges are not ordered
-static bool dp_prepare() {
-  gpmin.assign(VP, PNONE);
-  gpmax.assign(VP, 0);
-  for (auto& c : ctx)
-    for (int k = 0; k < VP; k++) {
-      gpmin[k] = std::min(gpmin[k], c.pmin[k]);
-      gpmax[k] = std::max(gpmax[k], c.pmax[k]);
-    }
-  gnonempty.clear();
-  for (int k = 0; k < VP; k++)
-    if (gpmin[k] != PNONE) gnonempty.push_back(k);
-  gprevmax.assign(VP, -1);
-  gnextmin.assign(VP, (i64)1 << 40);
-  for (size_t i = 0; i < gnonempty.size(); i++) {
-    int k = gnonempty[i];
-    if (i > 0) {
-      int j = gnonempty[i - 1];
-      if (gpmin[j] > gpmin[k]) return false;  // equal: a big person spans both (spilled)
-      gprevmax[k] = gpmax[j];
-    }
-    if (i + 1 < gnonempty.size()) gnextmin[k] = gpmin[gnonempty[i + 1]];
-  }
-  return true;
-}
-
-static void dp_route_clicks(ThreadCtx& c) {
-  for (Blk* b = c.clt.l[0].head; b; b = b->next) {
-    const ClT* rs = blk_data<ClT>(b);
-    for (u32 i = 0; i < b->n; i++) {
-      const ClT& r = rs[i];
-      int k = r.person == PNONE ? -1 : dp_find(r.person);
-      if (k >= 0 && dp_local(k, r.person)) {
-        *c.lcl.push((u32)k, c.arena) = r;
-      } else {
-        u32 pp = part_of_pkey(r.pkey);
-        Cl2* o = c.cl2.push(pp, c.arena);
-        o->pkey = r.pkey;
-        o->cref = r.cref;
-        o->idkey = r.idkey;
-        o->idt = r.idt;
-        o->ts = r.ts;
-        c.cnt2[pp]++;
-      }
-    }
-  }
-}
-
-static void dp_finish_run(ThreadCtx& c, int k, u32 person, const std::vector<ClT>& pcl) {
-  u32 exp = 0;
-  if (!owner[person].compare_exchange_strong(exp, (u32)k + 1)) {
-    g_abort.store(true);
-    return;
-  }
-  auto& run = c.run;
-  if (run.size() > 1)
-    std::sort(run.begin(), run.end(), [](const DPRec* a, const DPRec* b) { return a->pkey < b->pkey; });
-  for (size_t i = 0; i < run.size();) {
-    u64 pk = run[i]->pkey;
-    size_t j = i;
-    c.rev.clear();
-    for (; j < run.size() && run[j]->pkey == pk; j++) c.rev.push_back(((u64)run[j]->ts << 32) | run[j]->pc);
-    auto lo = std::lower_bound(pcl.begin(), pcl.end(), pk, [](const ClT& a, u64 v) { return a.pkey < v; });
-    c.rcl.clear();
-    for (auto it = lo; it != pcl.end() && it->pkey == pk; ++it)
-      c.rcl.push_back(CL{it->ts, (u32)(it->cref >> 48), it->idkey, it->idt, (const char*)(uintptr_t)(it->cref & PTR_MASK)});
-    const char* name = (pk & FLAG) ? lk_names[(u32)pk] : (const char*)(uintptr_t)run[i]->uref;
-    process_person(c, c.rev.data(), (u32)c.rev.size(), c.rcl.data(), (u32)c.rcl.size(), name);
-    i = j;
-  }
-  run.clear();
-}
-
-static void phaseB(ThreadCtx& c, int k) {
-  const u32 span = 1u << VSH;
-  if (c.slot.size() < span) {
-    c.slot.resize(span);
-    c.occ.assign(span / 64, 0);
-  }
-  DPRec* sl = c.slot.data();
-  u64* occ = c.occ.data();
-  bool any = false;
-  for (int t = 0; t < T; t++)
-    for (Blk* b = ctx[t].dp.l[k].head; b; b = b->next) {
-      const DPRec* rs = blk_data<DPRec>(b);
-      for (u32 i = 0; i < b->n; i++) {
-        u32 v = rs[i].vofs;
-        u64 bit = 1ULL << (v & 63);
-        if (!(occ[v >> 6] & bit)) {
-          occ[v >> 6] |= bit;
-          sl[v] = rs[i];
-        } else if (rs[i].ing < sl[v].ing) {
-          sl[v] = rs[i];
-        }
-      }
-      any |= b->n > 0;
-    }
-  if (!any) return;
-  c.pcl.clear();
-  for (int t = 0; t < T; t++)
-    for (Blk* b = ctx[t].lcl.l[k].head; b; b = b->next) {
-      const ClT* rs = blk_data<ClT>(b);
-      c.pcl.insert(c.pcl.end(), rs, rs + b->n);
-    }
-  std::sort(c.pcl.begin(), c.pcl.end(), [](const ClT& a, const ClT& b) { return a.pkey < b.pkey; });
-  u32 cur = PNONE;
-  for (u32 w = 0; w < span / 64; w++) {
-    u64 m = occ[w];
-    if (!m) continue;
-    occ[w] = 0;
-    for (; m; m &= m - 1) {
-      const DPRec* r = sl + (w * 64 + (u32)__builtin_ctzll(m));
-      if (r->ts == DEAD) continue;
-      u32 per = r->person;
-      if (dp_local(k, per)) {
-        if (per != cur) {
-          if (!c.run.empty()) dp_finish_run(c, k, cur, c.pcl);
-          cur = per;
-        }
-        c.run.push_back(r);
-        continue;
-      }
-      if (per != PNONE) {
-        u32 o = owner[per].load(std::memory_order_relaxed);
-        while (o != OWN_SPILL) {
-          if (o != 0) { g_abort.store(true); break; }
-          if (owner[per].compare_exchange_weak(o, OWN_SPILL)) break;
-        }
-      }
-      u32 pp = part_of_pkey(r->pkey);
-      Ev2* o = c.ev2.push(pp, c.arena);
-      o->pkey = r->pkey;
-      o->uref = r->uref;
-      o->ts = r->ts;
-      o->pc = r->pc;
-      c.cnt2[pp]++;
-    }
-  }
-  if (!c.run.empty()) dp_finish_run(c, k, cur, c.pcl);
-}
-
 // ---------------------------------------------------------------- parquet
 
 struct TW {
@@ -2082,22 +1796,9 @@ static std::string json_str(const std::string& j, const char* key) {
 static std::string OUT;
 static std::vector<int> p3order;
 
-static std::atomic<int> q_pb{0};
-static char** g_argv = nullptr;
-
-// The data is not shaped as the direct-placement path assumes: run again in
-// general mode. Nothing has been written yet.
-[[noreturn]] static void restart_generic(const char* why) {
-  fprintf(stderr, "direct placement off: %s\n", why);
-  setenv("PIPE_GENERIC", "1", 1);
-  execv("/proc/self/exe", g_argv);
-  die("re-exec failed");
-}
-
 static std::atomic<int> q_links{0}, q_lreg{0}, q_lglob{0}, q_lfin{0}, q_p2{0}, q_p3{0};
 
 static void worker(int tid) {
-  bar_tid = tid;
   ThreadCtx& c = ctx[tid];
   // links: parse, build regions, union, smallest name per person
   for (;;) {
@@ -2123,9 +1824,6 @@ static void worker(int tid) {
     lk_nlen.resize(acc);
     uf_par = new std::atomic<u32>[acc + 1];
     uf_best = new std::atomic<u32>[acc + 1];
-    uf_cp = new std::atomic<u32>[acc + 1];
-    for (u32 i = 0; i <= acc; i++) uf_cp[i].store(CP_UNSET, std::memory_order_relaxed);
-    lk_cperson.assign(acc + 1, PNONE);
     tlog("links regions");
   }
   bar.wait();
@@ -2151,14 +1849,6 @@ static void worker(int tid) {
     if (r >= LP) break;
     links_finalize_region(r);
   }
-  if (g_dp) {
-    u32 per = (lk_total + T - 1) / T;
-    u32 lo = std::min(lk_total, per * tid), hi = std::min(lk_total, lo + per);
-    for (u32 i = lo; i < hi; i++) {
-      u32 v = uf_cp[uf_find(i)].load(std::memory_order_relaxed);
-      lk_cperson[i] = v == CP_UNSET ? PNONE : v;
-    }
-  }
   bar.wait();
   if (tid == 0) tlog("links done");
   for (;;) {
@@ -2179,37 +1869,15 @@ static void worker(int tid) {
   c.ev1.finish();
   c.ev2.finish();
   c.cl2.finish();
-  c.dp.finish();
-  c.clt.finish();
   bar.wait();
-  if (tid == 0) {
-    tlog("phase 1 done");
-    if (g_dp && !dp_prepare()) restart_generic("person ranges not ordered");
-  }
-  bar.wait();
-  if (g_dp) {
-    dp_route_clicks(c);
-    c.lcl.finish();
-    c.cl2.finish();
-    bar.wait();
-  }
+  if (tid == 0) tlog("phase 1 done");
   for (;;) {
     int p = q_p2.fetch_add(1, std::memory_order_relaxed);
     if (p >= DP) break;
     phase2(c, p);
   }
-  if (g_dp) {
-    for (;;) {
-      int k = q_pb.fetch_add(1, std::memory_order_relaxed);
-      if (k >= VP) break;
-      phaseB(c, k);
-    }
-    c.ev2.finish();
-    c.cl2.finish();
-  }
   bar.wait();
   if (tid == 0) {
-    if (g_abort.load()) restart_generic("a person was split across partitions");
     tlog("phase 2 done");
     std::vector<std::pair<u64, int>> sz(P);
     for (int p = 0; p < P; p++) {
@@ -2256,8 +1924,7 @@ static void worker(int tid) {
   if (tid == 0) tlog("written");
 }
 
-int main(int, char** argv) {
-  g_argv = argv;
+int main() {
   g_t0 = std::chrono::steady_clock::now();
   umask(0);  // outputs removable by any user (the scorer's host user is not uid 1000)
   // One malloc heap that grows in big steps and never shrinks: on the grader's
@@ -2398,59 +2065,6 @@ int main(int, char** argv) {
   P = 1 << LOGP;
   DP = 1 << DLOG;
 
-  // direct placement: recover the generator's id keys from a sample of events
-  // Measured slower than the general path on 20M events (decoding and the
-  // index-ordered sweep cost more than they save), so it is opt-in.
-  if (getenv("PIPE_DP") && !getenv("PIPE_GENERIC")) {
-    std::vector<u64> em, um;
-    for (auto& f : ev_files) {
-      const char* p = chunk_start(f, 0);
-      if (!p) continue;
-      const char* end = f.base + f.size;
-      const char* fs[8];
-      const char* fe[8];
-      while (p < end && (em.size() < 64 || um.size() < 256)) {
-        bool ok;
-        p = parse_line<7>(p, end, fs, fe, ok);
-        if (!ok) continue;
-        i64 e = id_scrambled(fs[0], (size_t)(fe[0] - fs[0]), 'e');
-        i64 u = id_scrambled(fs[1], (size_t)(fe[1] - fs[1]), 'u');
-        if (e >= 0 && em.size() < 64) em.push_back(unmix((u64)e));
-        if (u >= 0 && um.size() < 256) um.push_back(unmix((u64)u));
-      }
-      if (em.size() >= 64 && um.size() >= 256) break;
-    }
-    u64 ncap = ev_bytes / 50 + 1024, pmax = ncap / 8 + 1024;
-    bool ek = false;
-    if (em.size() >= 64 && um.size() >= 256) {
-      std::atomic<bool> found{false};
-      std::vector<std::thread> ths;
-      std::vector<u64> keys(T, 0);
-      u64 step = ncap / (u64)T + 1;
-      for (int t = 0; t < T; t++)
-        ths.emplace_back([&, t]() {
-          if (recover_event_key_range(em, ncap, step * t, std::min(ncap, step * (t + 1)), &found, keys[t])) found.store(true);
-        });
-      for (auto& x : ths) x.join();
-      for (int t = 0; t < T && !ek; t++)
-        if (keys[t] || found.load()) {
-          // confirm: the key a thread reported must decode the samples
-          size_t ok = 0;
-          for (u64 x : em) ok += (((x ^ keys[t]) * SI1) & M40) < ncap;
-          if (ok >= em.size() * 9 / 10) { EVKEY = keys[t]; ek = true; }
-        }
-    }
-    if (ek && recover_user_key(um, pmax, USKEY)) {
-      g_dp = true;
-      NCAP = ncap;
-      PMAX = (u32)std::min<u64>(pmax, 0xFFFFFFF0u);
-      VP = (int)((NCAP >> VSH) + 1);
-      owner = (std::atomic<u32>*)calloc(PMAX, sizeof(u32));
-      taint = (u8*)calloc(PMAX, 1);
-    }
-    tlog(g_dp ? "keys recovered" : "keys not recovered");
-  }
-
   const size_t CH = 4 << 20;
   for (auto& f : ev_files)
     for (size_t a = 0; a < f.size; a += CH) chunks.push_back({0, &f, a, std::min(f.size, a + CH)});
@@ -2479,13 +2093,6 @@ int main(int, char** argv) {
     c.arena.init(per_thread * 3);
     c.ev1.init(DP); c.ev2.init(P); c.cl2.init(P);
     c.lend.resize(LP);
-    if (g_dp) {
-      c.dp.init(VP);
-      c.clt.init(1);
-      c.lcl.init(VP);
-      c.pmin.assign(VP, PNONE);
-      c.pmax.assign(VP, 0);
-    }
     {
       size_t lines = ln_bytes / 18 / (size_t)T + 1024;
       reserve_huge(c.ledges, lines + lines / 2);
@@ -2507,9 +2114,6 @@ int main(int, char** argv) {
   for (auto& x : th) x.join();
   tlog("done");
   if (g_debug) {
-    fprintf(stderr, "barrier idle Mcycles per thread:");
-    for (int t = 0; t < T; t++) fprintf(stderr, " %.0f", bar_idle[t] / 1e6);
-    fprintf(stderr, "\n");
     std::string sm = read_small("/proc/self/smaps_rollup");
     fprintf(stderr, "%s\n", sm.c_str()); size_t k = sm.find("AnonHugePages");
     if (k != std::string::npos) fprintf(stderr, "%s\n", sm.substr(k, sm.find('\n', k) - k).c_str());
