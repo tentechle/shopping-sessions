@@ -893,11 +893,15 @@ static std::vector<ThreadCtx> ctx;
 
 // ---------------------------------------------------------------- barrier
 
+static thread_local int bar_tid = 0;
+static u64 bar_idle[64];
 struct Barrier {
   std::atomic<int> count{0};
   std::atomic<int> gen{0};
   int n = 0;
   void wait() {
+    u64 t0 = g_debug ? __rdtsc() : 0;
+    struct Guard { u64 t0; ~Guard() { if (t0) bar_idle[bar_tid] += __rdtsc() - t0; } } guard{t0};
     int g = gen.load(std::memory_order_acquire);
     if (count.fetch_add(1, std::memory_order_acq_rel) == n - 1) {
       count.store(0, std::memory_order_relaxed);
@@ -2083,6 +2087,7 @@ static char** g_argv = nullptr;
 static std::atomic<int> q_links{0}, q_lreg{0}, q_lglob{0}, q_lfin{0}, q_p2{0}, q_p3{0};
 
 static void worker(int tid) {
+  bar_tid = tid;
   ThreadCtx& c = ctx[tid];
   // links: parse, build regions, union, smallest name per person
   for (;;) {
@@ -2492,6 +2497,9 @@ int main(int, char** argv) {
   for (auto& x : th) x.join();
   tlog("done");
   if (g_debug) {
+    fprintf(stderr, "barrier idle Mcycles per thread:");
+    for (int t = 0; t < T; t++) fprintf(stderr, " %.0f", bar_idle[t] / 1e6);
+    fprintf(stderr, "\n");
     std::string sm = read_small("/proc/self/smaps_rollup");
     fprintf(stderr, "%s\n", sm.c_str()); size_t k = sm.find("AnonHugePages");
     if (k != std::string::npos) fprintf(stderr, "%s\n", sm.substr(k, sm.find('\n', k) - k).c_str());
