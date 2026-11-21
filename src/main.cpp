@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <dirent.h>
 
@@ -44,11 +46,15 @@ static const u64 PTR_MASK = (1ULL << 48) - 1;
 static const u32 DEAD = 0xFFFFFFFFu;
 
 static bool g_debug = false;
+static bool g_populate = true;
 static std::chrono::steady_clock::time_point g_t0;
 static void tlog(const char* what) {
   if (!g_debug) return;
   double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_t0).count();
-  fprintf(stderr, "[%8.2f ms] %s\n", ms, what);
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  fprintf(stderr, "[%8.2f ms] %s (minflt %ld, sys %.0f ms)\n", ms, what, ru.ru_minflt,
+          ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3);
 }
 
 [[noreturn]] static void die(const char* msg) {
@@ -1456,7 +1462,14 @@ struct PCol {
 };
 
 static void write_parquet(const std::string& path, std::vector<PCol>& cols, size_t nrows) {
-  std::string out = "PAR1";
+  // pieces are written with writev straight from the column buffers
+  std::vector<std::string> small;
+  small.reserve(cols.size() * 2 + 4);
+  std::vector<std::pair<const char*, size_t>> parts;
+  i64 pos = 0;
+  auto add = [&](const char* d, size_t n) { parts.push_back({d, n}); pos += (i64)n; };
+  auto add_small = [&](std::string&& str) { small.push_back(std::move(str)); add(small.back().data(), small.back().size()); };
+  add_small("PAR1");
   std::vector<i64> page_off(cols.size()), chunk_sz(cols.size());
   for (size_t ci = 0; ci < cols.size() && nrows; ci++) {
     PCol& c = cols[ci];
@@ -1487,11 +1500,11 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
     h.i32f(4, 3);
     h.send();
     h.b += (char)0;
-    page_off[ci] = (i64)out.size();
-    out += h.b;
-    out += levels;
-    out.append(c.data, c.size);
-    chunk_sz[ci] = (i64)out.size() - page_off[ci];
+    page_off[ci] = pos;
+    add_small(std::move(h.b));
+    if (!levels.empty()) add_small(std::move(levels));
+    add(c.data, c.size);
+    chunk_sz[ci] = pos - page_off[ci];
   }
   TW m;
   m.i32f(1, 1);
@@ -1549,17 +1562,22 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
     m.listh(4, 12, 0);
   }
   m.b += (char)0;
-  out += m.b;
   u32 fl = (u32)m.b.size();
-  out.append((const char*)&fl, 4);
-  out += "PAR1";
+  m.b.append((const char*)&fl, 4);
+  m.b += "PAR1";
+  add_small(std::move(m.b));
   int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd < 0) die(("create " + path).c_str());
-  size_t w = 0;
-  while (w < out.size()) {
-    ssize_t r = write(fd, out.data() + w, out.size() - w);
-    if (r <= 0) die("write");
-    w += (size_t)r;
+  std::vector<struct iovec> iov;
+  for (auto& pr : parts)
+    if (pr.second) iov.push_back({(void*)pr.first, pr.second});
+  size_t k = 0;
+  while (k < iov.size()) {
+    ssize_t r = writev(fd, iov.data() + k, (int)std::min<size_t>(iov.size() - k, 1024));
+    if (r < 0) die("write");
+    size_t left = (size_t)r;
+    while (k < iov.size() && left >= iov[k].iov_len) { left -= iov[k].iov_len; k++; }
+    if (left) { iov[k].iov_base = (char*)iov[k].iov_base + left; iov[k].iov_len -= left; }
   }
   close(fd);
 }
@@ -1697,6 +1715,12 @@ static void worker(int tid) {
     int k = chunk_next.fetch_add(1, std::memory_order_relaxed);
     if (k >= (int)chunks.size()) break;
     const Chunk& ch = chunks[k];
+    if (g_populate) {
+      // fault the chunk's pages in one call instead of one trap per 64 KB
+      uintptr_t a0 = ((uintptr_t)ch.f->base + ch.a) & ~(uintptr_t)4095;
+      uintptr_t a1 = ((uintptr_t)ch.f->base + std::min(ch.f->size, ch.b + 4096) + 4095) & ~(uintptr_t)4095;
+      madvise((void*)a0, a1 - a0, 22 /* MADV_POPULATE_READ */);
+    }
     if (ch.kind == 0) parse_events(c, *ch.f, ch.a, ch.b);
 #ifndef EXP_NOCLICKS
     else parse_clicks(c, *ch.f, ch.a, ch.b);
@@ -1744,6 +1768,7 @@ int main() {
   g_t0 = std::chrono::steady_clock::now();
   umask(0);  // outputs removable by any user (the scorer's host user is not uid 1000)
   g_debug = getenv("PIPE_DEBUG") != nullptr;
+  g_populate = getenv("PIPE_NOPOP") == nullptr;
   const char* e;
   std::string DATA = (e = getenv("DATA_DIR")) ? e : "/data";
   OUT = (e = getenv("OUTPUT_DIR")) ? e : "/output";
