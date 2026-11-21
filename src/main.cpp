@@ -677,8 +677,19 @@ static int LLOG = 6, LP = 64;
 static std::vector<u64*> lk_reg;
 static std::vector<u64> lk_mask;
 static std::vector<u32> lk_cnt, lk_base;
-static std::vector<std::vector<const char*>> lk_lnames;
+struct Endpoint { u64 h; const char* name; u64 key; u32 len; };
+struct NameRef { const char* p; u64 key; u32 len; };
+static std::vector<std::vector<NameRef>> lk_lnames;
 static std::vector<const char*> lk_names;   // global id -> name pointer
+static std::vector<u64> lk_nkey;   // global id -> first 8 bytes, big-endian
+static std::vector<u32> lk_nlen;
+static inline u64 name_key(const char* p, size_t n) { return __builtin_bswap64(r8(p) & mask_lo(n)); }
+// byte-wise order of two linked ids by global index
+static inline int name_cmp(u32 a, u32 b) {
+  if (lk_nkey[a] != lk_nkey[b]) return lk_nkey[a] < lk_nkey[b] ? -1 : 1;
+  if (lk_nlen[a] <= 8 && lk_nlen[b] <= 8) return lk_nlen[a] < lk_nlen[b] ? -1 : (lk_nlen[a] > lk_nlen[b]);
+  return vcmp(lk_names[a], lk_names[b]);
+}
 static std::atomic<u32>* uf_par = nullptr;
 // zeroed huge-page memory for the link tables, a fixed slice per region
 struct LkMem {
@@ -701,7 +712,6 @@ static u32 lk_total = 0;
 static const u64 TAG_MASK = ~0xFFFFFFULL;
 static inline u64 lk_tag(u64 h) { return (h | (1ULL << 24)) & TAG_MASK; }
 
-struct Endpoint { u64 h; const char* name; };
 
 struct CL { u32 ts; u32 camp; u64 idkey, idt; const char* id; };    // a person's click, local copy
 struct Agg { u32 mn, mx, cnt, sid; u64 rev; };       // one 30-minute bucket of a person
@@ -790,8 +800,9 @@ static void parse_links(ThreadCtx& c, const MFile& f, size_t a, size_t b) {
     u64 ha = hash1(fs[0], (size_t)(fe[0] - fs[0]));
     u64 hb = hash1(fs[1], (size_t)(fe[1] - fs[1]));
     c.ledges.push_back({ha, hb});
-    c.lend[lreg(ha)].push_back({ha, fs[0]});
-    if (hb != ha) c.lend[lreg(hb)].push_back({hb, fs[1]});
+    size_t na = (size_t)(fe[0] - fs[0]), nb = (size_t)(fe[1] - fs[1]);
+    c.lend[lreg(ha)].push_back({ha, fs[0], name_key(fs[0], na), (u32)na});
+    if (hb != ha) c.lend[lreg(hb)].push_back({hb, fs[1], name_key(fs[1], nb), (u32)nb});
   }
 }
 
@@ -822,6 +833,7 @@ static void links_build_region(int r) {
   lk_reg[r] = tab;
   lk_mask[r] = slots - 1;
   auto& names = lk_lnames[r];
+  names.reserve(n);
   for (int t = 0; t < T; t++)
     for (auto& e : ctx[t].lend[r]) {
       u64 tag = lk_tag(e.h), s = e.h & (slots - 1);
@@ -830,7 +842,7 @@ static void links_build_region(int r) {
         if ((w & TAG_MASK) == tag) break;
         if (w == 0) {
           tab[s] = tag | (u64)names.size();
-          names.push_back(e.name);
+          names.push_back({e.name, e.key, e.len});
           break;
         }
         s = (s + 1) & (slots - 1);
@@ -843,7 +855,9 @@ static void links_globalize_region(int r) {
   u32 base = lk_base[r];
   auto& names = lk_lnames[r];
   for (u32 i = 0; i < names.size(); i++) {
-    lk_names[base + i] = names[i];
+    lk_names[base + i] = names[i].p;
+    lk_nkey[base + i] = names[i].key;
+    lk_nlen[base + i] = names[i].len;
     uf_par[base + i].store(base + i, std::memory_order_relaxed);
     uf_best[base + i].store(UINT32_MAX, std::memory_order_relaxed);
   }
@@ -882,7 +896,7 @@ static void links_best(u32 lo, u32 hi) {
     u32 r = uf_find(i);
     u32 cur = uf_best[r].load(std::memory_order_relaxed);
     for (;;) {
-      if (cur != UINT32_MAX && vcmp(lk_names[i], lk_names[cur]) >= 0) break;
+      if (cur != UINT32_MAX && name_cmp(i, cur) >= 0) break;
       if (uf_best[r].compare_exchange_weak(cur, i)) break;
     }
   }
@@ -1686,6 +1700,7 @@ static void worker(int tid) {
     parse_links(c, *lchunks[k].f, lchunks[k].a, lchunks[k].b);
   }
   bar.wait();
+  if (tid == 0) tlog("links parsed");
   for (;;) {
     int r = q_lreg.fetch_add(1, std::memory_order_relaxed);
     if (r >= LP) break;
@@ -1698,6 +1713,8 @@ static void worker(int tid) {
     lk_total = acc;
     if (acc >= (1u << 24)) die("too many linked ids");
     lk_names.resize(acc);
+    lk_nkey.resize(acc);
+    lk_nlen.resize(acc);
     uf_par = new std::atomic<u32>[acc + 1];
     uf_best = new std::atomic<u32>[acc + 1];
     tlog("links regions");
@@ -1709,14 +1726,17 @@ static void worker(int tid) {
     links_globalize_region(r);
   }
   bar.wait();
+  if (tid == 0) tlog("links globalized");
   links_union(c);
   bar.wait();
+  if (tid == 0) tlog("links union");
   {
     u32 per = (lk_total + T - 1) / T;
     u32 lo = std::min(lk_total, per * tid), hi = std::min(lk_total, lo + per);
     links_best(lo, hi);
   }
   bar.wait();
+  if (tid == 0) tlog("links best");
   for (;;) {
     int r = q_lfin.fetch_add(1, std::memory_order_relaxed);
     if (r >= LP) break;
