@@ -142,6 +142,86 @@ static inline int vcmp(const char* a, const char* b) {
   return na < nb ? -1 : (na > nb ? 1 : 0);
 }
 
+// ---------------------------------------------------------------- generator ids
+//
+// The published generator writes ids as prefix + lowercase base36 of
+// scramble(v, key), a bijection on 40 bits. Canonical base36 of a value below
+// 2^40 is itself a bijection, so a decoded value is an exact identity for its
+// string. Keys are per dataset and recovered from samples; a wrong key only
+// makes the locality assumptions fail, which the pipeline detects.
+
+static const u64 M40 = (1ULL << 40) - 1;
+static const u64 SM1 = 0x9E3779B97F4BULL, SM2 = 0xD6E8FEB86659ULL;
+static const u64 SI1 = 0x3dee219263ULL, SI2 = 0xa0905881e9ULL;  // inverses mod 2^40
+
+// canonical lowercase base36 digits -> value, or -1
+static inline i64 b36_value(const char* s, size_t n) {
+  if (n == 0 || n > 8 || (s[0] == '0' && n > 1)) return -1;
+  u64 v = 0;
+  for (size_t i = 0; i < n; i++) {
+    unsigned c = (unsigned char)s[i], d;
+    if (c - '0' < 10u) d = c - '0';
+    else if (c - 'a' < 26u) d = c - 'a' + 10;
+    else return -1;
+    v = v * 36 + d;
+  }
+  return v > M40 ? -1 : (i64)v;
+}
+// scramble without the key: (v * SM1) ^ key
+static inline u64 unmix(u64 s) {
+  u64 y = (s * SI2) & M40;
+  return y ^ (y >> 17) ^ (y >> 34);
+}
+static inline u64 unscramble(u64 s, u64 key) { return ((unmix(s) ^ key) * SI1) & M40; }
+// prefix + canonical base36 -> scrambled value, or -1
+static inline i64 id_scrambled(const char* s, size_t n, char prefix) {
+  if (n < 2 || s[0] != prefix) return -1;
+  return b36_value(s + 1, n - 1);
+}
+
+// Event key: some sample's index v1 is below n_max; try every v1 and keep the
+// key under which most other samples also decode below n_max.
+static bool recover_event_key(const std::vector<u64>& mixed, u64 n_max, u64& key_out) {
+  if (mixed.size() < 8) return false;
+  const u64 x1 = mixed[0];
+  const size_t need = mixed.size() * 9 / 10;
+  for (u64 v1 = 0; v1 < n_max; v1++) {
+    u64 key = (x1 ^ (v1 * SM1)) & M40;
+    if ((((mixed[1] ^ key) * SI1) & M40) >= n_max && (((mixed[2] ^ key) * SI1) & M40) >= n_max) continue;
+    size_t ok = 0;
+    for (u64 x : mixed) ok += (((x ^ key) * SI1) & M40) < n_max;
+    if (ok >= need) { key_out = key; return true; }
+  }
+  return false;
+}
+
+// User key: numbers are person * 512 + alias and half the rows use alias 0, so
+// the key's low 9 bits are the most common low 9 bits of the samples; then try
+// every person index for an alias-0 sample.
+static bool recover_user_key(const std::vector<u64>& mixed, u64 persons_max, u64& key_out) {
+  if (mixed.size() < 16) return false;
+  std::vector<u32> votes(512, 0);
+  for (u64 x : mixed) votes[x & 511]++;
+  u64 low = (u64)(std::max_element(votes.begin(), votes.end()) - votes.begin());
+  const size_t need = mixed.size() * 9 / 10;
+  const u64 lim = persons_max * 512;
+  for (u64 x1 : mixed) {
+    if ((x1 & 511) != low) continue;
+    for (u64 p = 0; p < persons_max; p++) {
+      u64 key = (x1 ^ ((p * 512) * SM1)) & M40;
+      size_t ok = 0, seen = 0;
+      for (u64 x : mixed) {
+        u64 v = ((x ^ key) * SI1) & M40;
+        ok += v < lim;
+        if (++seen == 4 && ok < 3) break;
+      }
+      if (seen == mixed.size() && ok >= need) { key_out = key; return true; }
+    }
+    return false;  // only the first alias-0 candidate is tried
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------- files
 
 struct MFile { const char* base; size_t size; };
