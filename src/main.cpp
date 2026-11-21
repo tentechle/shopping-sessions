@@ -1235,6 +1235,189 @@ static int NB = 0;        // 30-minute buckets in the window
 static u64 BRUTE_C = 64, BRUTE_K = 8;
 static int NCAT = 0;
 
+// Sessions, attribution and user_daily rows of one person: events as ts << 32 | pc
+// (any order), clicks unsorted.
+static void process_person(ThreadCtx& c, const u64* ev, u32 n, CL* ck, u32 m, const char* name) {
+  const int organic = NCAMP;
+  const u32 G = (u32)GAP;
+  Agg* bag = c.bag.data();
+  i64* catday = c.catday.data();
+  u32* mark = c.mark.data();
+  if (c.tb.size() < n) { c.tb.resize(n); c.pur.resize(n); c.sess.resize(n); }
+  u32* tb = c.tb.data();
+  u64* pur = c.pur.data();
+  u32 ntb = 0, npur = 0;
+  for (u32 k = 0; k < n; k++) {
+    u32 ts = (u32)(ev[k] >> 32);
+    u32 bk = ts / G;
+    Agg& a = bag[bk];
+    if (a.cnt == 0) {
+      tb[ntb++] = bk;
+      a.mn = a.mx = ts;
+    } else {
+      a.mn = std::min(a.mn, ts);
+      a.mx = std::max(a.mx, ts);
+    }
+    a.cnt++;
+    u32 price = (u32)ev[k] >> 8;
+    if (price) {
+      a.rev += price;
+      pur[npur++] = ev[k];
+    }
+  }
+  sort_u32(tb, ntb);
+  Sess* S = c.sess.data();
+  u32 ns = 0, prev = 0;
+  for (u32 k = 0; k < ntb; k++) {
+    Agg& a = bag[tb[k]];
+    if (k == 0 || a.mn - prev > G) {
+      S[ns].start = a.mn;
+      S[ns].day = (int)((WS + (i64)a.mn) / DAY_MS - day0);
+      S[ns].cnt = 0;
+      S[ns].rev = 0;
+      ns++;
+    }
+    S[ns - 1].cnt += a.cnt;
+    S[ns - 1].rev += a.rev;
+    a.sid = ns - 1;
+    prev = a.mx;
+  }
+  for (u32 k = 0; k < npur; k++) {
+    u32 ts = (u32)(pur[k] >> 32), pc = (u32)pur[k];
+    catday[(size_t)S[bag[ts / G].sid].day * NCAT + (pc & 255)] += pc >> 8;
+  }
+  for (u32 k = 0; k < ntb; k++) {
+    Agg& a = bag[tb[k]];
+    a.cnt = 0;
+    a.rev = 0;
+  }
+  // attribution
+  if (m == 0) {
+    for (u32 k = 0; k < ns; k++) {
+      size_t ci = (size_t)organic * ND + S[k].day;
+      c.c_sess[ci]++;
+      if (S[k].rev) { c.c_purch[ci]++; c.c_rev[ci] += (i64)S[k].rev; }
+    }
+  } else if ((u64)ns * m <= BRUTE_C + BRUTE_K * (u64)(ns + m)) {
+    for (u32 k = 0; k < ns; k++) {
+      u32 lo = S[k].start;
+      u64 hi = (u64)lo + (u64)W7;
+      int day = S[k].day;
+      u32 stamp = ++c.stamp;
+      int best = -1;
+      u32 bt = 0;
+      for (u32 q = 0; q < m; q++) {
+        u32 t = ck[q].ts;
+        if (t >= lo && t <= hi) {
+          u32 cp = ck[q].camp;
+          if (mark[cp] != stamp) {
+            mark[cp] = stamp;
+            c.c_assist[(size_t)cp * ND + day]++;
+          }
+          if (best < 0 || t > bt || (t == bt && id_cmp(ck[q], ck[best]) < 0)) {
+            best = (int)q;
+            bt = t;
+          }
+        }
+      }
+      int camp = best >= 0 ? (int)ck[best].camp : organic;
+      size_t ci = (size_t)camp * ND + day;
+      c.c_sess[ci]++;
+      if (S[k].rev) { c.c_purch[ci]++; c.c_rev[ci] += (i64)S[k].rev; }
+    }
+  } else {
+    // many sessions and clicks: credit by two pointers over sorted clicks,
+    // assists by merging each campaign's click intervals [t - 7d, t]
+    std::sort(ck, ck + m, [](const CL& x, const CL& y) { return cl_less(x, y); });
+    u32 hi = 0;
+    for (u32 k = 0; k < ns; k++) {
+      u32 s0 = S[k].start;
+      u64 sc = (u64)s0 + (u64)W7;
+      while (hi < m && ck[hi].ts <= sc) hi++;
+      int camp = (hi > 0 && ck[hi - 1].ts >= s0) ? (int)ck[hi - 1].camp : organic;
+      size_t ci = (size_t)camp * ND + S[k].day;
+      c.c_sess[ci]++;
+      if (S[k].rev) { c.c_purch[ci]++; c.c_rev[ci] += (i64)S[k].rev; }
+    }
+    if (c.ckey.size() < m) c.ckey.resize(m);
+    u64* key = c.ckey.data();
+    for (u32 q = 0; q < m; q++) key[q] = ((u64)ck[q].camp << 32) | ck[q].ts;
+    std::sort(key, key + m);
+    // first session index of each day
+    int* dfirst = c.dfirst.data();
+    {
+      u32 k = 0;
+      for (int d = 0; d <= ND; d++) {
+        while (k < ns && S[k].day < d) k++;
+        dfirst[d] = (int)k;
+      }
+    }
+    auto starts_lb = [&](i64 v) {  // first session with start >= v (branch-free)
+      u32 base = 0, len = ns;
+      while (len > 1) {
+        u32 half = len >> 1;
+        base = ((i64)S[base + half - 1].start < v) ? base + half : base;
+        len -= half;
+      }
+      return (len == 1 && (i64)S[base].start < v) ? base + 1 : base;
+    };
+    u32 q = 0;
+    while (q < m) {
+      u32 cp = (u32)(key[q] >> 32);
+      // merged intervals of session starts [t - 7d, t] (event coordinates: t - 7d .. t)
+      i64 L = (i64)(u32)key[q] - W7, R = (i64)(u32)key[q];
+      q++;
+      auto flush_iv = [&](i64 l, i64 r) {
+        u32 a0 = starts_lb(l), b0 = starts_lb(r + 1);
+        if (a0 >= b0) return;
+        for (int d = S[a0].day; d <= S[b0 - 1].day; d++) {
+          int lo2 = std::max((int)a0, dfirst[d]), hi2 = std::min((int)b0, dfirst[d + 1]);
+          if (hi2 > lo2) c.c_assist[(size_t)cp * ND + d] += hi2 - lo2;
+        }
+      };
+      while (q < m && (u32)(key[q] >> 32) == cp) {
+        i64 l2 = (i64)(u32)key[q] - W7, r2 = (i64)(u32)key[q];
+        if (l2 <= R + 1) {
+          R = std::max(R, r2);
+        } else {
+          flush_iv(L, R);
+          L = l2;
+          R = r2;
+        }
+        q++;
+      }
+      flush_iv(L, R);
+    }
+  }
+  // user_daily rows
+  u32 namelen = (u32)vlen(name);
+  for (u32 k = 0; k < ns;) {
+    int day = S[k].day;
+    i64 dsess = 0, devn = 0, drev = 0;
+    for (; k < ns && S[k].day == day; k++) {
+      dsess++;
+      devn += S[k].cnt;
+      drev += (i64)S[k].rev;
+    }
+    int top = -1;
+    if (drev) {
+      i64* cs = catday + (size_t)day * NCAT;
+      i64 bv = 0;
+      for (int ct = 0; ct < NCAT; ct++) {
+        if (cs[ct] > bv) { bv = cs[ct]; top = ct; }
+        cs[ct] = 0;
+      }
+    }
+    c.o_name.append((const char*)&namelen, 4);
+    c.o_name.append(name, namelen);
+    c.o_day.push_back((int32_t)(day0 + day));
+    c.o_sess.push_back(dsess);
+    c.o_evn.push_back(devn);
+    c.o_rev.push_back(drev);
+    c.o_top.push_back((int16_t)top);
+  }
+}
+
 static void phase3(ThreadCtx& c, int p) {
   size_t E = 0, C = 0;
   for (int t = 0; t < T; t++) {
@@ -1355,191 +1538,9 @@ static void phase3(ThreadCtx& c, int p) {
       }
   }
 
-  const int organic = NCAMP;
-  const u32 G = (u32)GAP;
-  Agg* bag = c.bag.data();
-  i64* catday = c.catday.data();
-  u32* mark = c.mark.data();
-  for (u32 pi = 0; pi < np; pi++) {
-    const u64* ev = evs + c.off[pi];
-    u32 n = c.off[pi + 1] - c.off[pi];
-    if (c.tb.size() < n) { c.tb.resize(n); c.pur.resize(n); c.sess.resize(n); }
-    u32* tb = c.tb.data();
-    u64* pur = c.pur.data();
-    u32 ntb = 0, npur = 0;
-    for (u32 k = 0; k < n; k++) {
-      u32 ts = (u32)(ev[k] >> 32);
-      u32 bk = ts / G;
-      Agg& a = bag[bk];
-      if (a.cnt == 0) {
-        tb[ntb++] = bk;
-        a.mn = a.mx = ts;
-      } else {
-        a.mn = std::min(a.mn, ts);
-        a.mx = std::max(a.mx, ts);
-      }
-      a.cnt++;
-      u32 price = (u32)ev[k] >> 8;
-      if (price) {
-        a.rev += price;
-        pur[npur++] = ev[k];
-      }
-    }
-    sort_u32(tb, ntb);
-    Sess* S = c.sess.data();
-    u32 ns = 0, prev = 0;
-    for (u32 k = 0; k < ntb; k++) {
-      Agg& a = bag[tb[k]];
-      if (k == 0 || a.mn - prev > G) {
-        S[ns].start = a.mn;
-        S[ns].day = (int)((WS + (i64)a.mn) / DAY_MS - day0);
-        S[ns].cnt = 0;
-        S[ns].rev = 0;
-        ns++;
-      }
-      S[ns - 1].cnt += a.cnt;
-      S[ns - 1].rev += a.rev;
-      a.sid = ns - 1;
-      prev = a.mx;
-    }
-    for (u32 k = 0; k < npur; k++) {
-      u32 ts = (u32)(pur[k] >> 32), pc = (u32)pur[k];
-      catday[(size_t)S[bag[ts / G].sid].day * NCAT + (pc & 255)] += pc >> 8;
-    }
-    for (u32 k = 0; k < ntb; k++) {
-      Agg& a = bag[tb[k]];
-      a.cnt = 0;
-      a.rev = 0;
-    }
-    // attribution
-    CL* ck = c.clv.data() + c.coff[pi];
-    u32 m = c.coff[pi + 1] - c.coff[pi];
-    if (m == 0) {
-      for (u32 k = 0; k < ns; k++) {
-        size_t ci = (size_t)organic * ND + S[k].day;
-        c.c_sess[ci]++;
-        if (S[k].rev) { c.c_purch[ci]++; c.c_rev[ci] += (i64)S[k].rev; }
-      }
-    } else if ((u64)ns * m <= BRUTE_C + BRUTE_K * (u64)(ns + m)) {
-      for (u32 k = 0; k < ns; k++) {
-        u32 lo = S[k].start;
-        u64 hi = (u64)lo + (u64)W7;
-        int day = S[k].day;
-        u32 stamp = ++c.stamp;
-        int best = -1;
-        u32 bt = 0;
-        for (u32 q = 0; q < m; q++) {
-          u32 t = ck[q].ts;
-          if (t >= lo && t <= hi) {
-            u32 cp = ck[q].camp;
-            if (mark[cp] != stamp) {
-              mark[cp] = stamp;
-              c.c_assist[(size_t)cp * ND + day]++;
-            }
-            if (best < 0 || t > bt || (t == bt && id_cmp(ck[q], ck[best]) < 0)) {
-              best = (int)q;
-              bt = t;
-            }
-          }
-        }
-        int camp = best >= 0 ? (int)ck[best].camp : organic;
-        size_t ci = (size_t)camp * ND + day;
-        c.c_sess[ci]++;
-        if (S[k].rev) { c.c_purch[ci]++; c.c_rev[ci] += (i64)S[k].rev; }
-      }
-    } else {
-      // many sessions and clicks: credit by two pointers over sorted clicks,
-      // assists by merging each campaign's click intervals [t - 7d, t]
-      std::sort(ck, ck + m, [](const CL& x, const CL& y) { return cl_less(x, y); });
-      u32 hi = 0;
-      for (u32 k = 0; k < ns; k++) {
-        u32 s0 = S[k].start;
-        u64 sc = (u64)s0 + (u64)W7;
-        while (hi < m && ck[hi].ts <= sc) hi++;
-        int camp = (hi > 0 && ck[hi - 1].ts >= s0) ? (int)ck[hi - 1].camp : organic;
-        size_t ci = (size_t)camp * ND + S[k].day;
-        c.c_sess[ci]++;
-        if (S[k].rev) { c.c_purch[ci]++; c.c_rev[ci] += (i64)S[k].rev; }
-      }
-      if (c.ckey.size() < m) c.ckey.resize(m);
-      u64* key = c.ckey.data();
-      for (u32 q = 0; q < m; q++) key[q] = ((u64)ck[q].camp << 32) | ck[q].ts;
-      std::sort(key, key + m);
-      // first session index of each day
-      int* dfirst = c.dfirst.data();
-      {
-        u32 k = 0;
-        for (int d = 0; d <= ND; d++) {
-          while (k < ns && S[k].day < d) k++;
-          dfirst[d] = (int)k;
-        }
-      }
-      auto starts_lb = [&](i64 v) {  // first session with start >= v (branch-free)
-        u32 base = 0, len = ns;
-        while (len > 1) {
-          u32 half = len >> 1;
-          base = ((i64)S[base + half - 1].start < v) ? base + half : base;
-          len -= half;
-        }
-        return (len == 1 && (i64)S[base].start < v) ? base + 1 : base;
-      };
-      u32 q = 0;
-      while (q < m) {
-        u32 cp = (u32)(key[q] >> 32);
-        // merged intervals of session starts [t - 7d, t] (event coordinates: t - 7d .. t)
-        i64 L = (i64)(u32)key[q] - W7, R = (i64)(u32)key[q];
-        q++;
-        auto flush_iv = [&](i64 l, i64 r) {
-          u32 a0 = starts_lb(l), b0 = starts_lb(r + 1);
-          if (a0 >= b0) return;
-          for (int d = S[a0].day; d <= S[b0 - 1].day; d++) {
-            int lo2 = std::max((int)a0, dfirst[d]), hi2 = std::min((int)b0, dfirst[d + 1]);
-            if (hi2 > lo2) c.c_assist[(size_t)cp * ND + d] += hi2 - lo2;
-          }
-        };
-        while (q < m && (u32)(key[q] >> 32) == cp) {
-          i64 l2 = (i64)(u32)key[q] - W7, r2 = (i64)(u32)key[q];
-          if (l2 <= R + 1) {
-            R = std::max(R, r2);
-          } else {
-            flush_iv(L, R);
-            L = l2;
-            R = r2;
-          }
-          q++;
-        }
-        flush_iv(L, R);
-      }
-    }
-    // user_daily rows
-    const char* name = (const char*)(uintptr_t)c.pname[pi];
-    u32 namelen = (u32)vlen(name);
-    for (u32 k = 0; k < ns;) {
-      int day = S[k].day;
-      i64 dsess = 0, devn = 0, drev = 0;
-      for (; k < ns && S[k].day == day; k++) {
-        dsess++;
-        devn += S[k].cnt;
-        drev += (i64)S[k].rev;
-      }
-      int top = -1;
-      if (drev) {
-        i64* cs = catday + (size_t)day * NCAT;
-        i64 bv = 0;
-        for (int ct = 0; ct < NCAT; ct++) {
-          if (cs[ct] > bv) { bv = cs[ct]; top = ct; }
-          cs[ct] = 0;
-        }
-      }
-      c.o_name.append((const char*)&namelen, 4);
-      c.o_name.append(name, namelen);
-      c.o_day.push_back((int32_t)(day0 + day));
-      c.o_sess.push_back(dsess);
-      c.o_evn.push_back(devn);
-      c.o_rev.push_back(drev);
-      c.o_top.push_back((int16_t)top);
-    }
-  }
+  for (u32 pi = 0; pi < np; pi++)
+    process_person(c, evs + c.off[pi], c.off[pi + 1] - c.off[pi], c.clv.data() + c.coff[pi],
+                   c.coff[pi + 1] - c.coff[pi], (const char*)(uintptr_t)c.pname[pi]);
 }
 
 // ---------------------------------------------------------------- parquet
