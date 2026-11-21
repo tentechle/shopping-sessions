@@ -142,15 +142,16 @@ static MFile map_file(const std::string& path) {
   fstat(fd, &st);
   size_t sz = (size_t)st.st_size;
   size_t pages = (sz + 4095) / 4096;
-  size_t total = pages * 4096 + 8192;
-  void* region = mmap(nullptr, total, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  // a zero page before (reads up to 16 bytes before a field) and after (SIMD over-reads)
+  size_t total = 4096 + pages * 4096 + 8192;
+  char* region = (char*)mmap(nullptr, total, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (region == MAP_FAILED) die("mmap anon");
   if (sz) {
-    void* r = mmap(region, sz, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE * 0, fd, 0);
+    void* r = mmap(region + 4096, sz, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
     if (r == MAP_FAILED) die("mmap file");
   }
   close(fd);
-  return MFile{(const char*)region, sz};
+  return MFile{region + 4096, sz};
 }
 
 static std::string read_small(const std::string& path) {
@@ -357,9 +358,39 @@ static void init_months(int y0, int m0, int count) {
   }
 }
 
+// "YYYY-MM-DDTHH:MM" digits (any validity) -> year, month, day, hour, minute
+__attribute__((always_inline)) static inline void cal_fields(__m128i d, int& y, int& mo, int& dd, int& h, int& mi) {
+  const __m128i idx = _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1);
+  const __m128i w = _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0);
+  __m128i pr = _mm_maddubs_epi16(_mm_shuffle_epi8(d, idx), w);  // u16: YY YY MM DD hh mm
+  u64 lo = (u64)_mm_cvtsi128_si64(pr), hi = (u64)_mm_extract_epi64(pr, 1);
+  y = (int)(lo & 0xFFFF) * 100 + (int)((lo >> 16) & 0xFFFF);
+  mo = (int)((lo >> 32) & 0xFFFF);
+  dd = (int)(lo >> 48);
+  h = (int)(hi & 0xFFFF);
+  mi = (int)((hi >> 16) & 0xFFFF);
+}
+
+// up to 16 ASCII digits ending at s + n (bytes before s must be readable); -1 if a non-digit
+__attribute__((always_inline)) static inline i64 digits16(const char* s, size_t n) {
+  const __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+  __m128i v = _mm_loadu_si128((const __m128i*)(s + n - 16));
+  __m128i keep = _mm_cmpgt_epi8(lane, _mm_set1_epi8((char)(15 - (int)n)));
+  __m128i d = _mm_and_si128(_mm_sub_epi8(v, _mm_set1_epi8('0')), keep);
+  __m128i ok = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+  if (_mm_movemask_epi8(ok) != 0xFFFF) return -1;
+  __m128i m1 = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+  __m128i m2 = _mm_madd_epi16(m1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+  __m128i m3 = _mm_packus_epi32(m2, m2);
+  __m128i m4 = _mm_madd_epi16(m3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+  u64 r = (u64)_mm_cvtsi128_si64(m4);
+  return (i64)(r & 0xFFFFFFFF) * 100000000LL + (i64)(r >> 32);
+}
+
 __attribute__((always_inline)) static inline i64 parse_ts(const char* s, size_t n) {
   if (n >= 5 && s[4] == '-') {
     if (n != 20 && n != 25) return BAD_TS;
+    int y, mo, dd, h, mi;
     {
       const __m128i v = _mm_loadu_si128((const __m128i*)s);
       const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
@@ -368,9 +399,9 @@ __attribute__((always_inline)) static inline i64 parse_ts(const char* s, size_t 
       const __m128i sep = _mm_cmpeq_epi8(v, pat);
       u32 m = ((u32)_mm_movemask_epi8(dig) & 0xDB6Fu) | ((u32)_mm_movemask_epi8(sep) & 0x2490u);
       if (m != 0xFFFFu || s[16] != ':' || !isd(s[17]) || !isd(s[18])) return BAD_TS;
+      cal_fields(d, y, mo, dd, h, mi);
     }
-    int y = d2(s) * 100 + d2(s + 2);
-    int mo = d2(s + 5), d = d2(s + 8), h = d2(s + 11), mi = d2(s + 14), se = d2(s + 17);
+    int d = dd, se = d2(s + 17);
     if (h > 23 || mi > 59 || se > 59) return BAD_TS;
     i64 days;
     int mk = y * 12 + mo - 1 - mt_base;
@@ -396,6 +427,10 @@ __attribute__((always_inline)) static inline i64 parse_ts(const char* s, size_t 
     return (days * 86400 + h * 3600 + mi * 60 + se) * 1000 - off;
   }
   if (n == 0) return BAD_TS;
+  if (n <= 16) {
+    i64 v = digits16(s, n);
+    return v < 0 ? BAD_TS : v;
+  }
   size_t i = 0;
   while (i < n && s[i] == '0') i++;
   if (n - i > 18) {
@@ -414,11 +449,12 @@ __attribute__((always_inline)) static inline i64 parse_ts(const char* s, size_t 
 // ingest_ts is always valid F1; returns seconds (BAD_TS if not F1-shaped)
 __attribute__((always_inline)) static inline i64 parse_ingest_s(const char* s, size_t n) {
   if (__builtin_expect(n == 20 && s[19] == 'Z', 1)) {
-    int y = d2(s) * 100 + d2(s + 2), mo = d2(s + 5), d = d2(s + 8);
+    int y, mo, d, h, mi;
+    cal_fields(_mm_sub_epi8(_mm_loadu_si128((const __m128i*)s), _mm_set1_epi8('0')), y, mo, d, h, mi);
     int mk = y * 12 + mo - 1 - mt_base;
     if (__builtin_expect((unsigned)mk < (unsigned)mt_n && mo >= 1 && mo <= 12, 1)) {
       i64 days = mt_first[mk] + d - 1;
-      return days * 86400 + d2(s + 11) * 3600 + d2(s + 14) * 60 + d2(s + 17);
+      return days * 86400 + h * 3600 + mi * 60 + d2(s + 17);
     }
   }
   i64 v = parse_ts(s, n);
@@ -1718,8 +1754,12 @@ int main() {
 
   std::string man = read_small(DATA + "/manifest.json");
   std::string ws = json_str(man, "window_start"), we = json_str(man, "window_end");
-  WS = parse_ts(ws.data(), ws.size());
-  WE = parse_ts(we.data(), we.size());
+  {
+    std::string pws = std::string(32, ' ') + ws + std::string(32, ' ');
+    std::string pwe = std::string(32, ' ') + we + std::string(32, ' ');
+    WS = parse_ts(pws.data() + 32, ws.size());
+    WE = parse_ts(pwe.data() + 32, we.size());
+  }
   if (WS == BAD_TS || WE == BAD_TS || WE <= WS) die("bad manifest");
   if (WE - WS >= 0xFFFFFFFFLL - W7 - 1) die("window too long");
   day0 = WS / DAY_MS;
